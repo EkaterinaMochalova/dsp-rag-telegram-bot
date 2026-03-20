@@ -83,9 +83,17 @@ CONFIRM_RE = re.compile(
     r"(?i)^\s*(ок|okay|ok|хорошо|спасибо|благодарю|подтверждаю|да,?\s*всё\s*ок|верно|супер|отлично)\s*[!.]*\s*$"
 )
 
+# Сообщения с ≥2 пронумерованными вопросами ("1. ...\n2. ...") роутим напрямую в RAG
+_MULTI_Q_RE = re.compile(r"(?m)^\s*\d+[\.\)]\s+\S")
+
 
 def is_confirmation(text: str) -> bool:
     return bool(CONFIRM_RE.match(text or ""))
+
+
+def has_multiple_questions(text: str) -> bool:
+    """Возвращает True если сообщение содержит ≥2 пронумерованных вопроса."""
+    return len(_MULTI_Q_RE.findall(text or "")) >= 2
 
 
 ADDRESS_PROGRAM_RE = re.compile(
@@ -112,10 +120,16 @@ SYSTEM = (
     "- Можно использовать списки.\n"
     "- Не используй символы **, __, * для форматирования и не применяй Markdown.\n"
     "- Без слова «Источник» и без названий документов.\n"
-    "- Можно 1–2 уместных эмоджи.\n\n"
+    "- Можно 1–2 уместных эмоджи.\n"
+    "- Если пользователь задаёт несколько пронумерованных вопросов — отвечай на каждый "
+    "по очереди, сохраняя ту же нумерацию.\n\n"
     "Если проблема техническая (карта не грузится / пустой экран / загрузка крутится), "
     "сначала предложи проверить: VPN, фаервол/AdBlock, кэш/инкогнито, другую сеть. "
-    "Только потом переходи к настройкам доступа.\n"
+    "Только потом переходи к настройкам доступа.\n\n"
+    "Маркировка рекламы (ОРД/ERIR): в наружной рекламе (OOH/DOOH) маркировка "
+    "рекламных материалов НЕ требуется — это требование распространяется только на "
+    "интернет-рекламу. Операторы наружной рекламы не обязаны маркировать размещения, "
+    "маркировка РМ остаётся на стороне рекламодателя/агентства только для digital-каналов.\n"
 )
 
 
@@ -685,16 +699,17 @@ async def main() -> None:
             await m.answer(build_address_program_confirmation(merged))
             return
 
-        # --- Inventory analytics ---
-        inv_reply = answer_inventory_question(text, store)
-        if inv_reply:
-            await m.answer(inv_reply)
-            return
+        # --- Inventory analytics (пропускаем для multi-question) ---
+        if not has_multiple_questions(text):
+            inv_reply = answer_inventory_question(text, store)
+            if inv_reply:
+                await m.answer(inv_reply)
+                return
 
         
 
-# 3) new address program request
-        if is_address_program_request(text):
+# 3) new address program request (пропускаем для multi-question)
+        if not has_multiple_questions(text) and is_address_program_request(text):
             draft = apply_geo_updates(text, text)
             missing = address_program_missing_fields(draft)
             if missing:
