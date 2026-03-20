@@ -194,6 +194,11 @@ class InventoryStore:
 
     @staticmethod
     def load(csv_path: str = DEFAULT_CSV_PATH) -> "InventoryStore":
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(
+                f"Inventory CSV not found: '{csv_path}'. "
+                f"Set INVENTORY_CSV_PATH in .env or place the file at that path."
+            )
         df = pd.read_csv(csv_path)
         df = _prepare_df(df)
         return InventoryStore(df=df, csv_path=csv_path)
@@ -253,6 +258,15 @@ _AGG_ALIASES = {
     "sum": ["сумм", "итого", "sum"],
     "count": ["сколько", "количество", "count", "шт", "штук", "экранов"],
 }
+
+# "количество" — слово слишком общее. Для count-запросов требуем хотя бы один
+# инвентарный сигнал, чтобы не роутить в inventory фразы вроде "количество выходов".
+_COUNT_SIGNALS = [
+    "по город", "по гео", "по регион", "по формат", "по тип",
+    "по оператор", "по подрядчик", "по владельц", "по размещен",
+    "экран", "поверхност", "конструкц", "оператор", "подрядчик",
+    "формат", "регион", "город", "гео", "площадк",
+]
 
 _GROUPBY_ALIASES = {
     "city": ["по город", "по гео", "по региона", "по населен", "разрез город", "в разрезе город"],
@@ -382,6 +396,10 @@ def parse_query(text: str, store: InventoryStore) -> Optional[ParsedQuery]:
     if agg is None:
         return None
 
+    # guard: "количество" слишком общее слово — требуем инвентарный сигнал
+    if agg == "count" and not any(sig in t for sig in _COUNT_SIGNALS):
+        return None
+
     # 2) metric
     metric = None
     if agg != "count":
@@ -465,7 +483,8 @@ def _match_value_from_vocab(
 
     vocab = vocab_norm_series.dropna().unique().tolist()
 
-    hits = [v for v in vocab if v and v in query_norm and len(v) >= 3]
+    hits = [v for v in vocab if v and len(v) >= 3
+            and re.search(r"\b" + re.escape(v) + r"\b", query_norm)]
     if hits:
         best = max(hits, key=len)
         tmp = pd.DataFrame({"n": vocab_norm_series, "o": orig_series})

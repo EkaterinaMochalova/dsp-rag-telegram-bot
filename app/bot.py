@@ -17,6 +17,7 @@ from inventory_qa import InventoryStore, answer_inventory_question
 #   "draft": "<all text merged>",
 # }
 PENDING: Dict[int, Dict[str, Any]] = {}
+_pending_lock = asyncio.Lock()
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -35,20 +36,11 @@ if not VECTOR_STORE_ID:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
-SUPPORT_TAGS = "@rragnarrokk @kayokin_25"
-FINANCE_TAG = "@Lilimoon00"
-CS_TAGS = "@rragnarrokk @kayokin_25"
+SUPPORT_TAGS = os.getenv("SUPPORT_TAGS", "")
+FINANCE_TAG = os.getenv("FINANCE_TAG", "")
+CS_TAGS = os.getenv("CS_TAGS", "")
 
-EMPLOYEE_USERNAMES = {
-    "rragnarrokk",
-    "cesar_danielr",
-    "anastezia_26",
-    "slabdostw",
-    "naikoros",
-    "elena_tsvetikova",
-    "ekaterinastaritsina",
-    "ilia_che",
-}
+EMPLOYEE_USERNAMES = set(filter(None, os.getenv("EMPLOYEE_USERNAMES", "").split(",")))
 CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, несколько моментов:
 
 • формат файла — должен быть JPG или MP4  
@@ -192,7 +184,7 @@ def build_thread_messages(m: types.Message, bot_id: int, max_depth: int = 6) -> 
 
 def ask_rag(thread_messages: List[Dict[str, str]]) -> str:
     resp = client.responses.create(
-        model="gpt-5.2",
+        model="gpt-4o",
         input=[{"role": "system", "content": SYSTEM}] + thread_messages,
         tools=[{"type": "file_search", "vector_store_ids": [VECTOR_STORE_ID]}],
     )
@@ -216,8 +208,11 @@ BUDGET_ANY_RE = re.compile(
 )
 
 
+_NBSP_RE = re.compile(r"[ \u00A0]")
+
+
 def _normalize_amount(num_str: str, scale: Optional[str]) -> int:
-    n = int(re.sub(r"[ \u00A0]", "", num_str))
+    n = int(_NBSP_RE.sub("", num_str))
     if not scale:
         return n
     s = scale.lower()
@@ -308,9 +303,13 @@ TIME_RANGE_HHMM_RE = re.compile(r"(?i)\b(\d{1,2}):(\d{2})\s*(?:-|–|—)\s*(\d{
 TIME_RANGE_RE = re.compile(r"(?i)\bс\s*(\d{1,2})(?::(\d{2}))?\s*(до|-|—)\s*(\d{1,2})(?::(\d{2}))?\b")
 
 
+_247_RE = re.compile(r"(?i)\b24/7\b")
+_DIGIT_RE = re.compile(r"\d")
+
+
 def has_schedule(text: str) -> bool:
     t = text or ""
-    return bool(TIME_RANGE_HHMM_RE.search(t) or TIME_RANGE_RE.search(t) or re.search(r"(?i)\b24/7\b", t))
+    return bool(TIME_RANGE_HHMM_RE.search(t) or TIME_RANGE_RE.search(t) or _247_RE.search(t))
 
 
 def normalize_schedule(text: str) -> Optional[str]:
@@ -419,8 +418,12 @@ GEO_ADD_RE = re.compile(r"(?is)\bдобав(ь|ьте)\s+в\s+гео\s+([^\n]+)"
 GEO_SET_RE = re.compile(r"(?is)\bгео\s+(?:теперь|только)\s+([^\n]+)")
 
 
+_GEO_SPLIT_RE = re.compile(r"[;,]|(?:\s+и\s+)")
+_GEO_STRIP_RE = re.compile(r"(?is)\b(гео|география|города|регионы)\s*[:\-]\s*[^\n]+\n?")
+
+
 def _split_geo_items(s: str) -> List[str]:
-    parts = re.split(r"[;,]|(?:\s+и\s+)", s)
+    parts = _GEO_SPLIT_RE.split(s)
     out = []
     for p in parts:
         p = p.strip()
@@ -471,7 +474,7 @@ def apply_geo_updates(draft: str, new_text: str) -> str:
     if not current_geo:
         return draft
 
-    cleaned = re.sub(r"(?is)\b(гео|география|города|регионы)\s*[:\-]\s*[^\n]+\n?", "", draft).strip()
+    cleaned = _GEO_STRIP_RE.sub("", draft).strip()
     return (cleaned + "\n" + f"Гео: {current_geo}").strip()
 
 
@@ -540,7 +543,7 @@ def should_treat_as_brief_update(text: str) -> bool:
         return True
 
     # короткое сообщение с цифрами обычно правка
-    if len(t) <= 160 and re.search(r"\d", t):
+    if len(t) <= 160 and _DIGIT_RE.search(t):
         return True
 
     return False
@@ -634,7 +637,8 @@ async def main() -> None:
         # 1) ready state: accept OK or apply any edits
         if pending and pending.get("kind") == "address_program_ready":
             if is_confirmation(text):
-                PENDING.pop(m.chat.id, None)
+                async with _pending_lock:
+                    PENDING.pop(m.chat.id, None)
                 await m.answer(
                     "Отлично, передаю в КС на подбор адресной программы ✅\n"
                     f"{CS_TAGS}\n\n"
@@ -650,13 +654,15 @@ async def main() -> None:
 
                 still_missing = address_program_missing_fields(merged)
                 if still_missing:
-                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
+                    async with _pending_lock:
+                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
                     await m.answer(
                         "Приняла правку 👍 Нужно уточнить ещё:\n" + "\n".join(f"• {x}" for x in still_missing)
                     )
                     return
 
-                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
+                async with _pending_lock:
+                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
                 await m.answer(build_address_program_confirmation(merged))
                 return
             # если не правка, идём дальше (inventory -> rag)
@@ -669,11 +675,13 @@ async def main() -> None:
 
             still_missing = address_program_missing_fields(merged)
             if still_missing:
-                PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
+                async with _pending_lock:
+                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
                 await m.answer("Спасибо! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
                 return
 
-            PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
+            async with _pending_lock:
+                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
             await m.answer(build_address_program_confirmation(merged))
             return
 
@@ -690,19 +698,21 @@ async def main() -> None:
             draft = apply_geo_updates(text, text)
             missing = address_program_missing_fields(draft)
             if missing:
-                PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": draft}
+                async with _pending_lock:
+                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": draft}
                 await m.answer(
                     "Чтобы собрать адресную программу, уточните, пожалуйста:\n"
                     + "\n".join(f"• {x}" for x in missing)
                 )
                 return
 
-            PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
+            async with _pending_lock:
+                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
             await m.answer(build_address_program_confirmation(draft))
             return
 
         # 4) default: RAG answer
-        await m.chat.do("typing")
+        await bot.send_chat_action(m.chat.id, "typing")
         try:
             thread_messages = build_thread_messages(m, bot_id, max_depth=6)
             if not thread_messages:
