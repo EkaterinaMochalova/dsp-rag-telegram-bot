@@ -279,6 +279,11 @@ FROM_TO_MONTH_RE = re.compile(
     rf"(?i)\bс\s*(\d{{1,2}})\s*({MONTHS})(?:\s*(\d{{4}}))?\s*по\s*(\d{{1,2}})\s*({MONTHS})(?:\s*(\d{{4}}))?\b"
 )
 
+# "с 1 по 10 апреля" — месяц только в конце
+FROM_TO_SHARED_MONTH_RE = re.compile(
+    rf"(?i)\bс\s*(\d{{1,2}})\s*по\s*(\d{{1,2}})\s*({MONTHS})(?:\s*(\d{{4}}))?\b"
+)
+
 MONTH_RANGE_RE = re.compile(
     rf"(?i)\b(\d{{1,2}})\s*({MONTHS})(?:\s*(\d{{4}}))?\s*(?:-|–|—)\s*(\d{{1,2}})\s*({MONTHS})?(?:\s*(\d{{4}}))?\b"
 )
@@ -293,6 +298,13 @@ def _last_match(pattern: re.Pattern, text: str) -> Optional[re.Match]:
 
 def extract_period(text: str) -> Optional[str]:
     low = (text or "").lower()
+
+    m = _last_match(FROM_TO_SHARED_MONTH_RE, low)
+    if m:
+        d1, d2, mon, year = m.groups()
+        if year:
+            return f"{int(d1)} {mon} {year} – {int(d2)} {mon} {year}"
+        return f"{int(d1)} {mon} – {int(d2)} {mon}"
 
     m = _last_match(FROM_TO_MONTH_RE, low)
     if m:
@@ -363,8 +375,15 @@ def normalize_schedule(text: str) -> Optional[str]:
 # Formats (как у тебя было)
 def extract_formats(text: str) -> Optional[str]:
     low = (text or "").lower()
+
+    # "все форматы" / "любые форматы" / "форматы все"
+    if re.search(r"\b(все|любые|any)\b.{0,15}\bформат|\bформат.{0,15}\b(все|любые|any)\b", low):
+        return "все форматы"
+
     found: List[str] = []
 
+    if "билборд" in low or "billboard" in low or r"\bbb\b" in low:
+        found.append("билборды")
     if "ситиформ" in low:
         found.append("ситиформаты")
     if "ситиборд" in low or "ситибодр" in low:
@@ -713,21 +732,23 @@ async def main() -> None:
 
         # 2) collecting state: keep merging until all fields exist
         if pending and pending.get("kind") == "address_program_collecting":
-            draft = pending.get("draft", "")
-            merged = (draft + "\n" + text).strip()
-            merged = apply_geo_updates(merged, text)
+            if should_treat_as_brief_update(text):
+                draft = pending.get("draft", "")
+                merged = (draft + "\n" + text).strip()
+                merged = apply_geo_updates(merged, text)
 
-            still_missing = address_program_missing_fields(merged)
-            if still_missing:
+                still_missing = address_program_missing_fields(merged)
+                if still_missing:
+                    async with _pending_lock:
+                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
+                    await m.answer("Спасибо, почти всё есть! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
+                    return
+
                 async with _pending_lock:
-                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
-                await m.answer("Спасибо, почти всё есть! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
+                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
+                await m.answer(build_address_program_confirmation(merged))
                 return
-
-            async with _pending_lock:
-                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
-            await m.answer(build_address_program_confirmation(merged))
-            return
+            # если не правка — идём дальше (inventory -> rag)
 
         # --- Inventory analytics (пропускаем для multi-question) ---
         if not has_multiple_questions(text):
