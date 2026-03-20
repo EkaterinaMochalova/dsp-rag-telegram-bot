@@ -5,7 +5,7 @@ import logging
 from dotenv import load_dotenv
 
 from openai import OpenAI
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart
 from typing import Optional, Dict, Any, List, Set, Tuple
 
@@ -610,6 +610,34 @@ async def main() -> None:
     @dp.message(CommandStart())
     async def start(m: types.Message) -> None:
         await m.answer("Привет! Я помогу по DSP. Задайте вопрос 🙂")
+
+    @dp.message(F.text.startswith("/learn"))
+    async def learn(m: types.Message) -> None:
+        username = (m.from_user.username or "") if m.from_user else ""
+        if username not in EMPLOYEE_USERNAMES:
+            return
+        fact = (m.text or "").removeprefix("/learn").strip()
+        if not fact:
+            await m.answer("Укажи факт: /learn <текст>")
+            return
+        try:
+            content = f"Факт из базы знаний:\n{fact}".encode()
+            uploaded = await asyncio.to_thread(
+                lambda: client.files.create(
+                    file=("fact.txt", content, "text/plain"),
+                    purpose="assistants",
+                )
+            )
+            await asyncio.to_thread(
+                lambda: client.vector_stores.files.create(
+                    vector_store_id=VECTOR_STORE_ID,
+                    file_id=uploaded.id,
+                )
+            )
+            await m.answer(f"✅ Запомнила: {fact}")
+        except Exception:
+            logging.exception("Failed to save fact to vector store")
+            await m.answer("Не удалось сохранить факт. Проверь логи.")
 
     @dp.message()
     async def handle(m: types.Message) -> None:
