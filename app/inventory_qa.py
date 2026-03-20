@@ -392,10 +392,10 @@ def parse_query(text: str, store: InventoryStore) -> Optional[ParsedQuery]:
     if not t:
         return None
 
-    # 1) agg
+    # 1) agg — используем \b чтобы "несколько" не матчило "сколько"
     agg = None
     for k, aliases in _AGG_ALIASES.items():
-        if any(a in t for a in aliases):
+        if any(re.search(r"\b" + re.escape(a), t) for a in aliases):
             agg = k
             break
     if agg is None:
@@ -406,11 +406,11 @@ def parse_query(text: str, store: InventoryStore) -> Optional[ParsedQuery]:
     if not any(sig in t for sig in _INVENTORY_SIGNALS):
         return None
 
-    # 2) metric
+    # 2) metric — тоже \b чтобы не было ложных совпадений
     metric = None
     if agg != "count":
         for m, aliases in _METRIC_ALIASES.items():
-            if any(a in t for a in aliases):
+            if any(re.search(r"\b" + re.escape(a), t) for a in aliases):
                 metric = m
                 break
         if metric is None and agg in ("avg", "median", "min", "max"):
