@@ -111,7 +111,9 @@ ADDRESS_PROGRAM_RE = re.compile(
 # ---------- RAG (knowledge base answers) ----------
 
 SYSTEM = (
-    "Ты — саппорт-ассистент DSP для клиентов.\n"
+    "Ты — Omnika, дружелюбный саппорт-ассистент DSP Omni360 для клиентов.\n"
+    "Будь тёплой и отзывчивой. Обращайся к пользователю на «вы».\n"
+    "Не копируй сухой язык документов — объясняй просто и по-человечески.\n"
     "Отвечай на основе результатов file_search и фактов из этого промпта.\n"
     "Если ни в базе знаний, ни в промпте нет ответа — НЕ выдумывай: задай 1–2 уточняющих вопроса или эскалируй.\n\n"
     "Стиль ответа:\n"
@@ -523,7 +525,7 @@ def build_address_program_confirmation(text: str) -> str:
     extra_line = f"• Дополнительно: {extras}\n" if extras else ""
 
     return (
-        "Приняла запрос на адресную программу. Проверьте, пожалуйста, всё ли верно:\n"
+        "Собрала всё! 🎉 Проверьте, пожалуйста:\n"
         f"• Гео: {geo}\n"
         f"• Бюджет: {budget} ({nds}, {commission})\n"
         f"• Форматы: {formats}\n"
@@ -609,7 +611,7 @@ async def main() -> None:
 
     @dp.message(CommandStart())
     async def start(m: types.Message) -> None:
-        await m.answer("Привет! Я помогу по DSP. Задайте вопрос 🙂")
+        await m.answer("Привет! Я Omnika — помощник по DSP Omni360. Спрашивайте, разберёмся вместе 🙂")
 
     @dp.message(F.text.startswith("/learn"))
     async def learn(m: types.Message) -> None:
@@ -669,8 +671,8 @@ async def main() -> None:
         # Finance routing
         if is_finance_question(text):
             await m.answer(
-                f"Похоже на вопрос по счетам/оплате 💳 Подключаю {FINANCE_TAG}.\n"
-                "Если можно, пришлите номер кампании/счёта и что нужно сделать."
+                f"Похоже, вопрос про счета или оплату 💳 Подключаю {FINANCE_TAG} — они помогут!\n"
+                "Если можно, пришлите номер кампании/счёта и опишите ситуацию."
             )
             return
 
@@ -682,7 +684,7 @@ async def main() -> None:
                 async with _pending_lock:
                     PENDING.pop(m.chat.id, None)
                 await m.answer(
-                    "Отлично, передаю в КС на подбор адресной программы ✅\n"
+                    "Отлично, передаю в КС — они подберут адресную программу! ✅\n"
                     f"{CS_TAGS}\n\n"
                     "Если появятся правки, просто напишите их в этот чат."
                 )
@@ -699,7 +701,7 @@ async def main() -> None:
                     async with _pending_lock:
                         PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
                     await m.answer(
-                        "Приняла правку 👍 Нужно уточнить ещё:\n" + "\n".join(f"• {x}" for x in still_missing)
+                        "Принято! 👍 Осталось ещё кое-что уточнить:\n" + "\n".join(f"• {x}" for x in still_missing)
                     )
                     return
 
@@ -719,7 +721,7 @@ async def main() -> None:
             if still_missing:
                 async with _pending_lock:
                     PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
-                await m.answer("Спасибо! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
+                await m.answer("Спасибо, почти всё есть! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
                 return
 
             async with _pending_lock:
@@ -744,7 +746,7 @@ async def main() -> None:
                 async with _pending_lock:
                     PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": draft}
                 await m.answer(
-                    "Чтобы собрать адресную программу, уточните, пожалуйста:\n"
+                    "Отлично, берусь за адресную программу! 🗺️ Уточните, пожалуйста, несколько деталей:\n"
                     + "\n".join(f"• {x}" for x in missing)
                 )
                 return
@@ -766,17 +768,16 @@ async def main() -> None:
             msg = str(e).lower()
             if "unsupported_country_region_territory" in msg or "country, region, or territory not supported" in msg:
                 await m.answer(
-                    "Сейчас не могу обратиться к базе знаний из-за ограничения по сети/региону 🌐\n"
-                    f"Подключаю саппорт: {SUPPORT_TAGS}"
+                    f"Ой, кажется, есть проблема с сетью с моей стороны 🌐 Подключаю коллег: {SUPPORT_TAGS}"
                 )
             else:
-                await m.answer(f"Не получилось проверить базу знаний. Подключаю саппорт: {SUPPORT_TAGS} 🙏")
+                await m.answer(f"Хм, по этому вопросу мне нужна помощь коллег 🙏 Передаю {SUPPORT_TAGS} — разберутся!")
             return
 
         if (not reply) or looks_like_unknown(reply):
             await m.answer(
-                f"Уточню и скоро вернусь 🙏 {SUPPORT_TAGS}, помогите, пожалуйста.\n"
-                "Пришлите, пожалуйста, ID кампании (или ссылку на неё) и скрины, если есть возможность."
+                f"Вопрос немного вне моей базы, но коллеги точно помогут! {SUPPORT_TAGS} 🙌\n"
+                "Чтобы разобраться быстрее — пришлите ID кампании (или ссылку) и скрины, если есть."
             )
             return
 
