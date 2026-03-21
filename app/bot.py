@@ -40,6 +40,7 @@ SUPPORT_TAGS = os.getenv("SUPPORT_TAGS", "")
 FINANCE_TAG = os.getenv("FINANCE_TAG", "")
 CS_TAGS = os.getenv("CS_TAGS", "")
 FEEDBACK_CHANNEL_ID = os.getenv("FEEDBACK_CHANNEL_ID", "")
+CALCULATOR_URL = os.getenv("CALCULATOR_URL", "https://omni360.adtech.systems/page103658706.html")
 
 EMPLOYEE_USERNAMES = set(filter(None, os.getenv("EMPLOYEE_USERNAMES", "").split(",")))
 CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, несколько моментов:
@@ -800,17 +801,13 @@ async def main() -> None:
                 return
             # если не правка — идём дальше (inventory -> rag)
 
-        # --- Inventory analytics (пропускаем для multi-question) ---
-        if not has_multiple_questions(text):
-            inv_reply = answer_inventory_question(text, store)
-            if inv_reply:
-                await m.answer(inv_reply)
-                return
-
-        
-
-# 3) new address program request (пропускаем для multi-question)
+        # --- New address program request — проверяем ДО inventory, иначе inventory перехватит бриф ---
         if not has_multiple_questions(text) and is_address_program_request(text):
+            is_urgent = bool(re.search(r"(?i)(срочн|до\s+\d+[\-:]\d+|до\s+обед|до\s+конца\s+дня|asap)", text))
+            urgent_tip = (
+                f"\n\nЕсли очень срочно — можно прикинуть самостоятельно: {CALCULATOR_URL}"
+                if is_urgent else ""
+            )
             draft = apply_geo_updates(text, text)
             missing = address_program_missing_fields(draft)
             if missing:
@@ -819,13 +816,21 @@ async def main() -> None:
                 await m.answer(
                     "Отлично, берусь за адресную программу! 🗺️ Уточните, пожалуйста, несколько деталей:\n"
                     + "\n".join(f"• {x}" for x in missing)
+                    + urgent_tip
                 )
                 return
 
             async with _pending_lock:
                 PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
-            await m.answer(build_address_program_confirmation(draft))
+            await m.answer(build_address_program_confirmation(draft) + urgent_tip)
             return
+
+        # --- Inventory analytics (пропускаем для multi-question) ---
+        if not has_multiple_questions(text):
+            inv_reply = answer_inventory_question(text, store)
+            if inv_reply:
+                await m.answer(inv_reply)
+                return
 
         # 4) default: RAG answer
         await bot.send_chat_action(m.chat.id, "typing")
