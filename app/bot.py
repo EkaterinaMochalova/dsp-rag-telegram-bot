@@ -1,7 +1,9 @@
 import os
 import re
+import time
 import asyncio
 import logging
+from collections import defaultdict
 from dotenv import load_dotenv
 
 from openai import OpenAI
@@ -15,9 +17,15 @@ from inventory_qa import InventoryStore, answer_inventory_question
 # {
 #   "kind": "address_program_collecting" | "address_program_ready",
 #   "draft": "<all text merged>",
+#   "created_at": float (unix timestamp),
 # }
 PENDING: Dict[int, Dict[str, Any]] = {}
 _pending_lock = asyncio.Lock()
+
+STATE_TTL_SECONDS = int(os.getenv("STATE_TTL_HOURS", "24")) * 3600
+
+# Metrics: счётчики запросов и исходов
+METRICS: Dict[str, int] = defaultdict(int)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -54,6 +62,32 @@ CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, нескол�
 • сам файл, который загружаете  
 
 Тогда быстрее разберёмся, в чём проблема 🙏"""
+
+
+def _log_metrics() -> None:
+    total = METRICS.get("total", 0)
+    if not total:
+        return
+    resolved = METRICS.get("resolved", 0)
+    escalated = METRICS.get("escalated", 0)
+    pct = f"{100 * resolved // total}%" if total else "n/a"
+    parts = [f"total={total}", f"resolved={resolved}({pct})", f"escalated={escalated}"]
+    for key in sorted(METRICS):
+        if key.startswith("type."):
+            parts.append(f"{key[5:]}={METRICS[key]}")
+    logging.info("METRICS | " + " | ".join(parts))
+
+
+def track(query_type: str, resolved: bool) -> None:
+    """Трекает тип запроса и его исход, раз в 10 запросов пишет агрегат в лог."""
+    METRICS["total"] += 1
+    METRICS[f"type.{query_type}"] += 1
+    if resolved:
+        METRICS["resolved"] += 1
+    else:
+        METRICS["escalated"] += 1
+    if METRICS["total"] % 10 == 0:
+        _log_metrics()
 
 
 def is_employee(m: types.Message) -> bool:
@@ -684,11 +718,13 @@ async def main() -> None:
             
         # ===== CREATIVE ISSUE (L1 support) =====
         if is_creative_upload_issue(text):
+            track("creative", resolved=True)
             await m.answer(CREATIVE_HELP_REPLY)
             return
 
         # Finance routing
         if is_finance_question(text):
+            track("finance", resolved=False)
             await m.answer(
                 f"Похоже, вопрос про счета или оплату 💳 Подключаю {FINANCE_TAG} — они помогут!\n"
                 "Если можно, пришлите номер кампании/счёта и опишите ситуацию."
@@ -697,11 +733,22 @@ async def main() -> None:
 
         pending = PENDING.get(m.chat.id)
 
+        # TTL: сбрасываем зависший стейт после STATE_TTL_SECONDS
+        if pending and time.time() - pending.get("created_at", 0) > STATE_TTL_SECONDS:
+            async with _pending_lock:
+                PENDING.pop(m.chat.id, None)
+            pending = None
+            await m.answer(
+                "Предыдущий подбор адресной программы устарел и был сброшен.\n"
+                "Если нужен новый подбор — напишите бриф заново 🙂"
+            )
+
         # 1) ready state: accept OK or apply any edits
         if pending and pending.get("kind") == "address_program_ready":
             if is_confirmation(text):
                 async with _pending_lock:
                     PENDING.pop(m.chat.id, None)
+                track("address_program", resolved=False)
                 await m.answer(
                     "Отлично, передаю в КС — они подберут адресную программу! ✅\n"
                     f"{CS_TAGS}\n\n"
@@ -718,14 +765,14 @@ async def main() -> None:
                 still_missing = address_program_missing_fields(merged)
                 if still_missing:
                     async with _pending_lock:
-                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
+                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged, "created_at": time.time()}
                     await m.answer(
                         "Принято! 👍 Осталось ещё кое-что уточнить:\n" + "\n".join(f"• {x}" for x in still_missing)
                     )
                     return
 
                 async with _pending_lock:
-                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
+                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged, "created_at": time.time()}
                 await m.answer(build_address_program_confirmation(merged))
                 return
             # если не правка, идём дальше (inventory -> rag)
@@ -740,12 +787,12 @@ async def main() -> None:
                 still_missing = address_program_missing_fields(merged)
                 if still_missing:
                     async with _pending_lock:
-                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged}
+                        PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": merged, "created_at": time.time()}
                     await m.answer("Спасибо, почти всё есть! Осталось уточнить:\n" + "\n".join(f"• {x}" for x in still_missing))
                     return
 
                 async with _pending_lock:
-                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged}
+                    PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": merged, "created_at": time.time()}
                 await m.answer(build_address_program_confirmation(merged))
                 return
             # если не правка — идём дальше (inventory -> rag)
@@ -754,18 +801,17 @@ async def main() -> None:
         if not has_multiple_questions(text):
             inv_reply = answer_inventory_question(text, store)
             if inv_reply:
+                track("inventory", resolved=True)
                 await m.answer(inv_reply)
                 return
 
-        
-
-# 3) new address program request (пропускаем для multi-question)
+        # 3) new address program request (пропускаем для multi-question)
         if not has_multiple_questions(text) and is_address_program_request(text):
             draft = apply_geo_updates(text, text)
             missing = address_program_missing_fields(draft)
             if missing:
                 async with _pending_lock:
-                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": draft}
+                    PENDING[m.chat.id] = {"kind": "address_program_collecting", "draft": draft, "created_at": time.time()}
                 await m.answer(
                     "Отлично, берусь за адресную программу! 🗺️ Уточните, пожалуйста, несколько деталей:\n"
                     + "\n".join(f"• {x}" for x in missing)
@@ -773,7 +819,7 @@ async def main() -> None:
                 return
 
             async with _pending_lock:
-                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
+                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft, "created_at": time.time()}
             await m.answer(build_address_program_confirmation(draft))
             return
 
@@ -786,6 +832,7 @@ async def main() -> None:
             reply = await asyncio.to_thread(ask_rag, thread_messages)
         except Exception as e:
             logging.exception("OpenAI call failed")
+            track("rag", resolved=False)
             msg = str(e).lower()
             if "unsupported_country_region_territory" in msg or "country, region, or territory not supported" in msg:
                 await m.answer(
@@ -796,15 +843,31 @@ async def main() -> None:
             return
 
         if (not reply) or looks_like_unknown(reply):
+            track("rag", resolved=False)
             await m.answer(
                 f"Вопрос немного вне моей базы, но коллеги точно помогут! {SUPPORT_TAGS} 🙌\n"
                 "Чтобы разобраться быстрее — пришлите ID кампании (или ссылку) и скрины, если есть."
             )
             return
 
+        track("rag", resolved=True)
         await m.answer(reply)
 
+    async def _hourly_metrics() -> None:
+        """Каждый час пишет метрики в лог и чистит протухшие PENDING."""
+        while True:
+            await asyncio.sleep(3600)
+            _log_metrics()
+            now = time.time()
+            expired = [cid for cid, s in list(PENDING.items()) if now - s.get("created_at", 0) > STATE_TTL_SECONDS]
+            if expired:
+                async with _pending_lock:
+                    for cid in expired:
+                        PENDING.pop(cid, None)
+                logging.info("PENDING cleanup: removed %d expired states", len(expired))
+
     logging.info("Bot started ✅")
+    asyncio.create_task(_hourly_metrics())
     await dp.start_polling(bot)
 
 
