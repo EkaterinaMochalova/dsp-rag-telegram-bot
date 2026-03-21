@@ -39,6 +39,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 SUPPORT_TAGS = os.getenv("SUPPORT_TAGS", "")
 FINANCE_TAG = os.getenv("FINANCE_TAG", "")
 CS_TAGS = os.getenv("CS_TAGS", "")
+FEEDBACK_CHANNEL_ID = os.getenv("FEEDBACK_CHANNEL_ID", "")
 
 EMPLOYEE_USERNAMES = set(filter(None, os.getenv("EMPLOYEE_USERNAMES", "").split(",")))
 CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, несколько моментов:
@@ -73,9 +74,20 @@ FINANCE_RE = re.compile(
     r"возврат|refund|баланс|биллинг|billing)\b"
 )
 
+_FEEDBACK_RE = re.compile(
+    r"(?i)(хотелось\s+бы|было\s+бы\s+(хорош|удобн|круто|класс)|"
+    r"не\s+хватает|можно\s+(добавить|сделать|реализовать)|"
+    r"предлагаю|а\s+можно\s+ли|планируется\s+ли|будет\s+ли\s+(функц|возможн)|"
+    r"добавьте\b|сделайте\b|хочу\s+предложить|пожелани|wish|feature\s+request)"
+)
+
 
 def is_finance_question(text: str) -> bool:
     return bool(FINANCE_RE.search(text or ""))
+
+
+def is_feedback(text: str) -> bool:
+    return bool(_FEEDBACK_RE.search(text or ""))
 
 
 # короткие подтверждения клиента
@@ -695,6 +707,21 @@ async def main() -> None:
                 "Если можно, пришлите номер кампании/счёта и опишите ситуацию."
             )
             return
+
+        # Тихо логируем пожелания по доработкам в канал (бот всё равно отвечает через RAG)
+        if FEEDBACK_CHANNEL_ID and is_feedback(text):
+            try:
+                user = m.from_user
+                sender = f"@{user.username}" if user and user.username else (user.full_name if user else "неизвестно")
+                chat_name = m.chat.title or "личка"
+                fb_msg = (
+                    f"💡 *Запрос на доработку*\n"
+                    f"От: {sender} | {chat_name}\n\n"
+                    f"{text}"
+                )
+                await bot.send_message(FEEDBACK_CHANNEL_ID, fb_msg, parse_mode="Markdown")
+            except Exception:
+                logging.exception("Failed to forward feedback to channel")
 
         pending = PENDING.get(m.chat.id)
 
