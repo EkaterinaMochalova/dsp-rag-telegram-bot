@@ -638,6 +638,13 @@ def is_address_program_request(text: str) -> bool:
     has_address = any(m in t for m in address_markers)
     has_analytics = any(m in t for m in analytics_markers)
 
+    # Структурированный бриф: 3+ из ключевых полей = точно адресная программа,
+    # даже если внутри упоминаются аналитические термины (ots, количество и т.п.)
+    brief_fields = ["клиент", "период", "бюджет", "гео:", "kpi", "экраны:", "расчёт", "расчет"]
+    brief_field_count = sum(1 for f in brief_fields if f in t)
+    if brief_field_count >= 2:
+        return True
+
     # если вопрос аналитический, не уводим в адреску
     if has_analytics and not ("адрес" in t or "подбор" in t or "подбери" in t):
         return False
