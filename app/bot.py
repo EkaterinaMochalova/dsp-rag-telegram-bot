@@ -81,6 +81,16 @@ _FEEDBACK_RE = re.compile(
     r"добавьте\b|сделайте\b|хочу\s+предложить|пожелани|wish|feature\s+request)"
 )
 
+# Детектор "всё проверили, не помогло" → эскалация в КС
+_ESCALATION_RE = re.compile(
+    r"(?i)(все\s+(проверил|проверили|равно)|всё\s+(проверил|проверили|равно)|"
+    r"по.прежнему\s+(не\s+)?(работает|идут|показ)|"
+    r"ничего\s+не\s+(помогло|помогает|изменилось)|"
+    r"все\s+равно\s+не|всё\s+равно\s+не|"
+    r"до\s+сих\s+пор\s+не|так\s+и\s+не\s+(заработал|пошл|идут|работает)|"
+    r"перезапустил|перезапустили|переделал|переделали)"
+)
+
 
 def is_finance_question(text: str) -> bool:
     return bool(FINANCE_RE.search(text or ""))
@@ -88,6 +98,10 @@ def is_finance_question(text: str) -> bool:
 
 def is_feedback(text: str) -> bool:
     return bool(_FEEDBACK_RE.search(text or ""))
+
+
+def is_exhausted_troubleshooting(text: str) -> bool:
+    return bool(_ESCALATION_RE.search(text or ""))
 
 
 # короткие подтверждения клиента
@@ -698,6 +712,14 @@ async def main() -> None:
         # ===== CREATIVE ISSUE (L1 support) =====
         if is_creative_upload_issue(text):
             await m.answer(CREATIVE_HELP_REPLY)
+            return
+
+        # Эскалация: пользователь всё проверил, проблема осталась → зовём КС
+        if is_exhausted_troubleshooting(text):
+            await m.answer(
+                f"Понятно, давайте подключим коллег из КС — они разберутся! {CS_TAGS} 🙌\n"
+                "Пришлите, пожалуйста, ID кампании (или ссылку) и скриншоты, если есть — так будет быстрее."
+            )
             return
 
         # Finance routing
