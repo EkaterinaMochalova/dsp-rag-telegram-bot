@@ -666,8 +666,9 @@ async def main() -> None:
         if not text:
             return
 
-        # ignore employees
-        if is_employee(m):
+        # В группах игнорируем сотрудников (чтобы бот не влезал во внутренние обсуждения)
+        # В личке отвечаем всем (сотрудники могут тестировать бота)
+        if m.chat.type in {"group", "supergroup"} and is_employee(m):
             return
 
         # В группе отвечаем только если позвали (тегом/реплаем), если флаг включен
