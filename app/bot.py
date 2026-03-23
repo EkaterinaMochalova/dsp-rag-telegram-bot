@@ -738,10 +738,6 @@ async def main() -> None:
         if is_employee(m) and m.chat.type in {"group", "supergroup"}:
             if not is_called_in_group(m, bot_username=bot_username, bot_id=bot_id):
                 return
-        # В группах игнорируем сотрудников (чтобы бот не влезал во внутренние обсуждения)
-        # В личке отвечаем всем (сотрудники могут тестировать бота)
-        if m.chat.type in {"group", "supergroup"} and is_employee(m):
-            return
 
         # В группе (не сотрудники) отвечаем только если позвали, если флаг включен
         if not is_employee(m) and m.chat.type in {"group", "supergroup"} and REQUIRE_MENTION_IN_GROUP:
@@ -889,8 +885,6 @@ async def main() -> None:
 
             async with _pending_lock:
                 PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft, "created_at": time.time()}
-            await m.answer(build_address_program_confirmation(draft))
-                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
             await m.answer(build_address_program_confirmation(draft) + urgent_tip)
             return
 
