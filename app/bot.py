@@ -700,12 +700,13 @@ async def main() -> None:
         if not text:
             return
 
-        # ignore employees
-        if is_employee(m):
-            return
+        # Сотрудники в группах — отвечаем только при явном @упоминании или реплае
+        if is_employee(m) and m.chat.type in {"group", "supergroup"}:
+            if not is_called_in_group(m, bot_username=bot_username, bot_id=bot_id):
+                return
 
-        # В группе отвечаем только если позвали (тегом/реплаем), если флаг включен
-        if m.chat.type in {"group", "supergroup"} and REQUIRE_MENTION_IN_GROUP:
+        # В группе (не сотрудники) отвечаем только если позвали, если флаг включен
+        if not is_employee(m) and m.chat.type in {"group", "supergroup"} and REQUIRE_MENTION_IN_GROUP:
             if not is_called_in_group(m, bot_username=bot_username, bot_id=bot_id):
                 return
 
