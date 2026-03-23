@@ -47,6 +47,8 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 SUPPORT_TAGS = os.getenv("SUPPORT_TAGS", "")
 FINANCE_TAG = os.getenv("FINANCE_TAG", "")
 CS_TAGS = os.getenv("CS_TAGS", "")
+FEEDBACK_CHANNEL_ID = os.getenv("FEEDBACK_CHANNEL_ID", "")
+CALCULATOR_URL = os.getenv("CALCULATOR_URL", "https://omni360.adtech.systems/page103658706.html")
 
 EMPLOYEE_USERNAMES = set(filter(None, os.getenv("EMPLOYEE_USERNAMES", "").split(",")))
 CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, несколько моментов:
@@ -107,9 +109,34 @@ FINANCE_RE = re.compile(
     r"возврат|refund|баланс|биллинг|billing)\b"
 )
 
+_FEEDBACK_RE = re.compile(
+    r"(?i)(хотелось\s+бы|было\s+бы\s+(хорош|удобн|круто|класс)|"
+    r"не\s+хватает|можно\s+(добавить|сделать|реализовать)|"
+    r"предлагаю|а\s+можно\s+ли|планируется\s+ли|будет\s+ли\s+(функц|возможн)|"
+    r"добавьте\b|сделайте\b|хочу\s+предложить|пожелани|wish|feature\s+request)"
+)
+
+# Детектор "всё проверили, не помогло" → эскалация в КС
+_ESCALATION_RE = re.compile(
+    r"(?i)(все\s+(проверил|проверили|равно)|всё\s+(проверил|проверили|равно)|"
+    r"по.прежнему\s+(не\s+)?(работает|идут|показ)|"
+    r"ничего\s+не\s+(помогло|помогает|изменилось)|"
+    r"все\s+равно\s+не|всё\s+равно\s+не|"
+    r"до\s+сих\s+пор\s+не|так\s+и\s+не\s+(заработал|пошл|идут|работает)|"
+    r"перезапустил|перезапустили|переделал|переделали)"
+)
+
 
 def is_finance_question(text: str) -> bool:
     return bool(FINANCE_RE.search(text or ""))
+
+
+def is_feedback(text: str) -> bool:
+    return bool(_FEEDBACK_RE.search(text or ""))
+
+
+def is_exhausted_troubleshooting(text: str) -> bool:
+    return bool(_ESCALATION_RE.search(text or ""))
 
 
 # короткие подтверждения клиента
@@ -645,6 +672,13 @@ def is_address_program_request(text: str) -> bool:
     has_address = any(m in t for m in address_markers)
     has_analytics = any(m in t for m in analytics_markers)
 
+    # Структурированный бриф: 3+ из ключевых полей = точно адресная программа,
+    # даже если внутри упоминаются аналитические термины (ots, количество и т.п.)
+    brief_fields = ["клиент", "период", "бюджет", "гео:", "kpi", "экраны:", "расчёт", "расчет"]
+    brief_field_count = sum(1 for f in brief_fields if f in t)
+    if brief_field_count >= 2:
+        return True
+
     # если вопрос аналитический, не уводим в адреску
     if has_analytics and not ("адрес" in t or "подбор" in t or "подбери" in t):
         return False
@@ -704,6 +738,10 @@ async def main() -> None:
         if is_employee(m) and m.chat.type in {"group", "supergroup"}:
             if not is_called_in_group(m, bot_username=bot_username, bot_id=bot_id):
                 return
+        # В группах игнорируем сотрудников (чтобы бот не влезал во внутренние обсуждения)
+        # В личке отвечаем всем (сотрудники могут тестировать бота)
+        if m.chat.type in {"group", "supergroup"} and is_employee(m):
+            return
 
         # В группе (не сотрудники) отвечаем только если позвали, если флаг включен
         if not is_employee(m) and m.chat.type in {"group", "supergroup"} and REQUIRE_MENTION_IN_GROUP:
@@ -723,6 +761,14 @@ async def main() -> None:
             await m.answer(CREATIVE_HELP_REPLY)
             return
 
+        # Эскалация: пользователь всё проверил, проблема осталась → зовём КС
+        if is_exhausted_troubleshooting(text):
+            await m.answer(
+                f"Понятно, давайте подключим коллег из КС — они разберутся! {CS_TAGS} 🙌\n"
+                "Пришлите, пожалуйста, ID кампании (или ссылку) и скриншоты, если есть — так будет быстрее."
+            )
+            return
+
         # Finance routing
         if is_finance_question(text):
             track("finance", resolved=False)
@@ -731,6 +777,21 @@ async def main() -> None:
                 "Если можно, пришлите номер кампании/счёта и опишите ситуацию."
             )
             return
+
+        # Тихо логируем пожелания по доработкам в канал (бот всё равно отвечает через RAG)
+        if FEEDBACK_CHANNEL_ID and is_feedback(text):
+            try:
+                user = m.from_user
+                sender = f"@{user.username}" if user and user.username else (user.full_name if user else "неизвестно")
+                chat_name = m.chat.title or "личка"
+                fb_msg = (
+                    f"💡 *Запрос на доработку*\n"
+                    f"От: {sender} | {chat_name}\n\n"
+                    f"{text}"
+                )
+                await bot.send_message(FEEDBACK_CHANNEL_ID, fb_msg, parse_mode="Markdown")
+            except Exception:
+                logging.exception("Failed to forward feedback to channel")
 
         pending = PENDING.get(m.chat.id)
 
@@ -807,7 +868,13 @@ async def main() -> None:
                 return
 
         # 3) new address program request (пропускаем для multi-question)
+        # --- New address program request — проверяем ДО inventory, иначе inventory перехватит бриф ---
         if not has_multiple_questions(text) and is_address_program_request(text):
+            is_urgent = bool(re.search(r"(?i)(срочн|до\s+\d+[\-:]\d+|до\s+обед|до\s+конца\s+дня|asap)", text))
+            urgent_tip = (
+                f"\n\nЕсли очень срочно — можно прикинуть самостоятельно: {CALCULATOR_URL}"
+                if is_urgent else ""
+            )
             draft = apply_geo_updates(text, text)
             missing = address_program_missing_fields(draft)
             if missing:
@@ -816,13 +883,23 @@ async def main() -> None:
                 await m.answer(
                     "Отлично, берусь за адресную программу! 🗺️ Уточните, пожалуйста, несколько деталей:\n"
                     + "\n".join(f"• {x}" for x in missing)
+                    + urgent_tip
                 )
                 return
 
             async with _pending_lock:
                 PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft, "created_at": time.time()}
             await m.answer(build_address_program_confirmation(draft))
+                PENDING[m.chat.id] = {"kind": "address_program_ready", "draft": draft}
+            await m.answer(build_address_program_confirmation(draft) + urgent_tip)
             return
+
+        # --- Inventory analytics (пропускаем для multi-question) ---
+        if not has_multiple_questions(text):
+            inv_reply = answer_inventory_question(text, store)
+            if inv_reply:
+                await m.answer(inv_reply)
+                return
 
         # 4) default: RAG answer
         await bot.send_chat_action(m.chat.id, "typing")
