@@ -19,14 +19,9 @@ from typing import Optional
 
 try:
     import gspread
-    from google.oauth2.service_account import Credentials
     _GSPREAD_AVAILABLE = True
 except ImportError:
     _GSPREAD_AVAILABLE = False
-
-_SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-]
 
 _SHEET_HEADERS = [
     "Дата/время",
@@ -60,8 +55,7 @@ def _build_worksheet() -> Optional[object]:
             with open(creds_raw) as f:
                 info = json.load(f)
 
-        creds = Credentials.from_service_account_info(info, scopes=_SCOPES)
-        gc = gspread.authorize(creds)
+        gc = gspread.service_account_from_dict(info)
         sh = gc.open_by_key(sheets_id)
 
         try:
