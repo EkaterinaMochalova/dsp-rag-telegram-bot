@@ -12,6 +12,7 @@ from aiogram.filters import CommandStart
 from typing import Optional, Dict, Any, List, Set, Tuple
 
 from inventory_qa import InventoryStore, answer_inventory_question
+import sheets_logger
 
 # chat_id -> state dict
 # {
@@ -80,7 +81,7 @@ def _log_metrics() -> None:
     logging.info("METRICS | " + " | ".join(parts))
 
 
-def track(query_type: str, resolved: bool) -> None:
+async def track(query_type: str, resolved: bool, m: Optional[types.Message] = None) -> None:
     """Трекает тип запроса и его исход, раз в 10 запросов пишет агрегат в лог."""
     METRICS["total"] += 1
     METRICS[f"type.{query_type}"] += 1
@@ -90,6 +91,10 @@ def track(query_type: str, resolved: bool) -> None:
         METRICS["escalated"] += 1
     if METRICS["total"] % 10 == 0:
         _log_metrics()
+    if m is not None and sheets_logger.is_configured():
+        username = (m.from_user.username or "") if m.from_user else ""
+        text = (m.text or "").strip()
+        asyncio.create_task(sheets_logger.log_async(query_type, resolved, m.chat.id, username, text))
 
 
 def is_employee(m: types.Message) -> bool:
@@ -757,7 +762,7 @@ async def main() -> None:
             
         # ===== CREATIVE ISSUE (L1 support) =====
         if is_creative_upload_issue(text):
-            track("creative", resolved=True)
+            await track("creative", resolved=True, m=m)
             await m.answer(CREATIVE_HELP_REPLY)
             return
 
@@ -771,7 +776,7 @@ async def main() -> None:
 
         # Finance routing
         if is_finance_question(text):
-            track("finance", resolved=False)
+            await track("finance", resolved=False, m=m)
             await m.answer(
                 f"Похоже, вопрос про счета или оплату 💳 Подключаю {FINANCE_TAG} — они помогут!\n"
                 "Если можно, пришлите номер кампании/счёта и опишите ситуацию."
@@ -810,7 +815,7 @@ async def main() -> None:
             if is_confirmation(text):
                 async with _pending_lock:
                     PENDING.pop(m.chat.id, None)
-                track("address_program", resolved=False)
+                await track("address_program", resolved=False, m=m)
                 await m.answer(
                     "Отлично, передаю в КС — они подберут адресную программу! ✅\n"
                     f"{CS_TAGS}\n\n"
@@ -863,7 +868,7 @@ async def main() -> None:
         if not has_multiple_questions(text):
             inv_reply = answer_inventory_question(text, store)
             if inv_reply:
-                track("inventory", resolved=True)
+                await track("inventory", resolved=True, m=m)
                 await m.answer(inv_reply)
                 return
 
@@ -908,7 +913,7 @@ async def main() -> None:
             reply = await asyncio.to_thread(ask_rag, thread_messages)
         except Exception as e:
             logging.exception("OpenAI call failed")
-            track("rag", resolved=False)
+            await track("rag", resolved=False, m=m)
             msg = str(e).lower()
             if "unsupported_country_region_territory" in msg or "country, region, or territory not supported" in msg:
                 await m.answer(
@@ -919,14 +924,14 @@ async def main() -> None:
             return
 
         if (not reply) or looks_like_unknown(reply):
-            track("rag", resolved=False)
+            await track("rag", resolved=False, m=m)
             await m.answer(
                 f"Вопрос немного вне моей базы, но коллеги точно помогут! {SUPPORT_TAGS} 🙌\n"
                 "Чтобы разобраться быстрее — пришлите ID кампании (или ссылку) и скрины, если есть."
             )
             return
 
-        track("rag", resolved=True)
+        await track("rag", resolved=True, m=m)
         await m.answer(reply)
 
     async def _hourly_metrics() -> None:
