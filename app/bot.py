@@ -121,6 +121,19 @@ _FEEDBACK_RE = re.compile(
     r"добавьте\b|сделайте\b|хочу\s+предложить|пожелани|wish|feature\s+request)"
 )
 
+# Детектор запросов на ускорение согласования креативов у операторов
+_APPROVAL_ACCEL_RE = re.compile(
+    r"(?i)(ускор(ить|ьте|им|яй)?\s+(согласован|модерац|провер)|"
+    r"согласован\w*\s+(идёт\s+долго|затянул|задержива|не\s+идёт)|"
+    r"помоч(ь|ите)?\s+ускорить|нужно\s+(срочно\s+)?согласовать|"
+    r"отправила?\s+на\s+согласован|на\s+согласован\w+\s+операторам)"
+)
+
+
+def is_approval_acceleration(text: str) -> bool:
+    return bool(_APPROVAL_ACCEL_RE.search(text or ""))
+
+
 # Детектор "всё проверили, не помогло" → эскалация в КС
 _ESCALATION_RE = re.compile(
     r"(?i)(все\s+(проверил|проверили|равно)|всё\s+(проверил|проверили|равно)|"
@@ -760,6 +773,12 @@ async def main() -> None:
             if mentions:
                 return
             
+        # ===== APPROVAL ACCELERATION =====
+        if is_approval_acceleration(text):
+            await track("approval_accel", resolved=True, m=m)
+            await m.answer("Передадим оператору информацию — попросим ускорить согласование! 🙌")
+            return
+
         # ===== CREATIVE ISSUE (L1 support) =====
         if is_creative_upload_issue(text):
             await track("creative", resolved=True, m=m)
