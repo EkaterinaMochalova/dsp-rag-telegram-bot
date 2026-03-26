@@ -1578,6 +1578,14 @@ async def main() -> None:
 
     logging.info("Bot started ✅")
     asyncio.create_task(_hourly_metrics())
+    await bot.set_my_commands([
+        types.BotCommand(command="geo",       description="Найти место на карте: /geo ТЦ Метрополис city=Москва"),
+        types.BotCommand(command="near",      description="Экраны рядом с точкой: /near 55.71 37.55 2"),
+        types.BotCommand(command="near_geo",  description="Экраны рядом с результатами /geo: /near_geo 1.5"),
+        types.BotCommand(command="pick_city", description="Выбрать N экранов по городу: /pick_city Москва 20"),
+        types.BotCommand(command="pick_at",   description="Выбрать N экранов в радиусе: /pick_at 55.75 37.62 30 15"),
+        types.BotCommand(command="plan",      description="Медиаплан по бюджету: /plan budget=500k city=Москва n=15"),
+    ])
     await dp.start_polling(bot)
 
 
