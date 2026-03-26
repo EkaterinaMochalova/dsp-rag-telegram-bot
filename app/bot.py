@@ -1,18 +1,26 @@
 import os
 import re
+import io
 import json
+import math
 import time
+import random
 import asyncio
 import logging
 from collections import defaultdict
 from dotenv import load_dotenv
 
+import aiohttp
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
+from aiogram.filters import CommandStart, Command
+from aiogram.types import BufferedInputFile
 from typing import Optional, Dict, Any, List, Set, Tuple
 
 from inventory_qa import InventoryStore, answer_inventory_question
+from geo_ai import find_poi_ai
+from geo_nominatim import geocode_query as nominatim_geocode
+from overpass_provider import search_overpass
 import sheets_logger
 
 # chat_id -> state dict
@@ -104,6 +112,235 @@ def _build_system_with_facts() -> str:
         + facts_block
         + "\n"
     )
+
+
+# ---------- Geo / selection utilities ----------
+
+PLAN_MAX_PLAYS_PER_HOUR = int(os.getenv("PLAN_MAX_PLAYS_PER_HOUR", "120"))
+DEFAULT_RADIUS = float(os.getenv("DEFAULT_RADIUS_KM", "2.0"))
+
+# per-chat last POI and last selection result
+LAST_POI: Dict[int, List[Dict]] = {}
+LAST_RESULT: Dict[int, Any] = {}
+
+
+def haversine_km(a: Tuple[float, float], b: Tuple[float, float]) -> float:
+    lat1, lon1 = math.radians(a[0]), math.radians(a[1])
+    lat2, lon2 = math.radians(b[0]), math.radians(b[1])
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    h = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return 2 * 6371.0088 * math.asin(math.sqrt(h))
+
+
+def find_within_radius(df: Any, center: Tuple[float, float], radius_km: float) -> Any:
+    import pandas as pd
+    rows = []
+    for _, row in df.iterrows():
+        try:
+            d = haversine_km(center, (float(row["lat"]), float(row["lon"])))
+        except Exception:
+            continue
+        if d <= radius_km:
+            rows.append({
+                "screen_id": row.get("screen_id", row.get("GID", "")),
+                "name": row.get("name", row.get("address", "")),
+                "city": row.get("city", ""),
+                "format": row.get("format", ""),
+                "owner": row.get("owner", ""),
+                "lat": row["lat"],
+                "lon": row["lon"],
+                "distance_km": round(d, 3),
+            })
+    out = pd.DataFrame(rows)
+    return out.sort_values("distance_km").reset_index(drop=True) if not out.empty else out
+
+
+def spread_select(df: Any, n: int, *, random_start: bool = True, seed: Optional[int] = None) -> Any:
+    """Жадный k-center (Gonzalez) с рандомным стартом."""
+    import pandas as pd
+    if df.empty or n <= 0:
+        return df.iloc[0:0]
+    n = min(n, len(df))
+    if seed is not None:
+        random.seed(seed)
+    coords = df[["lat", "lon"]].to_numpy()
+    if random_start:
+        start_idx = random.randrange(len(df))
+    else:
+        lat_med = float(df["lat"].median())
+        lon_med = float(df["lon"].median())
+        start_idx = min(range(len(df)), key=lambda i: haversine_km((lat_med, lon_med), (coords[i][0], coords[i][1])))
+    chosen = [start_idx]
+    dists = [haversine_km((coords[start_idx][0], coords[start_idx][1]), (coords[i][0], coords[i][1])) for i in range(len(df))]
+    while len(chosen) < n:
+        maxd = max(dists)
+        candidates = [i for i, d in enumerate(dists) if d == maxd]
+        next_idx = random.choice(candidates)
+        chosen.append(next_idx)
+        cx, cy = coords[next_idx]
+        for i in range(len(df)):
+            d = haversine_km((cx, cy), (coords[i][0], coords[i][1]))
+            if d < dists[i]:
+                dists[i] = d
+    res = df.iloc[chosen].copy()
+    res["min_dist_to_others_km"] = 0.0
+    cc = res[["lat", "lon"]].to_numpy()
+    for i in range(len(res)):
+        mind = min(haversine_km((cc[i][0], cc[i][1]), (cc[j][0], cc[j][1])) for j in range(len(res)) if j != i) if len(res) > 1 else 0.0
+        res.iat[i, res.columns.get_loc("min_dist_to_others_km")] = round(mind, 3)
+    return res
+
+
+def parse_kwargs(parts: List[str]) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    for p in parts:
+        if "=" in p:
+            k, v = p.split("=", 1)
+            out[k.strip().lower()] = v.strip().strip('"').strip("'")
+    return out
+
+
+def _format_mask(series: Any, token: str) -> Any:
+    col = series.astype(str).str.upper().str.strip()
+    t = token.strip().upper()
+    if t in {"CITY", "CITY_FORMAT", "CITYFORMAT", "CITYLIGHT"}:
+        return col.str.startswith("CITY_FORMAT")
+    if t in {"BILLBOARD", "BB"}:
+        return col == "BILLBOARD"
+    return col == t
+
+
+def _apply_inv_filters(df: Any, kwargs: Dict[str, str]) -> Any:
+    import pandas as pd
+    out = df.copy()
+    fmt_val = kwargs.get("format") or kwargs.get("formats")
+    if fmt_val and "format" in out.columns:
+        tokens = [t.strip().upper() for t in re.split(r"[;,|]", str(fmt_val)) if t.strip()]
+        col = out["format"].astype(str).str.upper()
+        mask = None
+        for f in tokens:
+            m = _format_mask(col, f)
+            mask = m if mask is None else (mask | m)
+        if mask is not None:
+            out = out[mask]
+    own_val = kwargs.get("owner") or kwargs.get("owners")
+    if own_val and "owner" in out.columns:
+        owners = [t.strip().lower() for t in re.split(r"[;,|]", str(own_val)) if t.strip()]
+        col = out["owner"].astype(str).str.lower()
+        mask = None
+        for o in owners:
+            m = col.str.contains(re.escape(o), na=False)
+            mask = m if mask is None else (mask | m)
+        if mask is not None:
+            out = out[mask]
+    grp_min_raw = kwargs.get("grp_min")
+    if grp_min_raw and "grp" in out.columns:
+        try:
+            grp_min = float(str(grp_min_raw).replace(",", "."))
+            grp_num = pd.to_numeric(out["grp"], errors="coerce")
+            out = out[grp_num.ge(grp_min).fillna(False)]
+        except Exception:
+            pass
+    ots_min_raw = kwargs.get("ots_min")
+    if ots_min_raw and "ots" in out.columns:
+        try:
+            ots_min = float(str(ots_min_raw).replace(",", "."))
+            ots_num = pd.to_numeric(out["ots"], errors="coerce")
+            out = out[ots_num.ge(ots_min).fillna(False)]
+        except Exception:
+            pass
+    return out
+
+
+def _fill_min_bid(df: Any) -> Any:
+    import pandas as pd
+    out = df.copy()
+    src_col = next((c for c in ("minBid", "min_bid", "min_bid_rub") if c in out.columns), None)
+    if src_col:
+        vals = pd.to_numeric(out[src_col], errors="coerce")
+        median = float(vals.median()) if not vals.dropna().empty else 0.0
+        out["min_bid_used"] = vals.fillna(median)
+    else:
+        out["min_bid_used"] = None
+    return out
+
+
+def _prefer_formats(df: Any, n: int) -> Any:
+    import pandas as pd
+    if "format" not in df.columns or df.empty:
+        return df
+    col = df["format"].astype(str).str.upper()
+    parts = [
+        df[col == "BILLBOARD"],
+        df[col == "SUPERSITE"],
+        df[col.str.startswith("CITY_FORMAT")],
+        df[~col.isin(["BILLBOARD", "SUPERSITE"]) & ~col.str.startswith("CITY_FORMAT")],
+    ]
+    pool = pd.concat(parts, ignore_index=True)
+    return pool.head(max(n * 5, n))
+
+
+def _as_list_any(sep_str: Optional[str]) -> List[str]:
+    if not sep_str:
+        return []
+    s = sep_str.replace(";", ",").replace("|", ",")
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+
+def _parse_hours_windows(s: Optional[str]) -> Optional[int]:
+    if not s:
+        return None
+    total = 0
+    for p in [x.strip() for x in s.split(",") if x.strip()]:
+        if "-" in p:
+            try:
+                a, b = [int(x) for x in p.split("-", 1)]
+                if 0 <= a <= 23 and 0 <= b <= 23:
+                    total += (b - a) if b > a else (24 - a + b)
+            except Exception:
+                pass
+    return total or None
+
+
+async def _geocode_any(query: str, city: Optional[str] = None, limit: int = 5, provider: str = "nominatim") -> List[Dict]:
+    """Геокодирование через один из провайдеров."""
+    if provider == "openai":
+        return await find_poi_ai(query=query, city=city, limit=limit)
+    if provider == "overpass":
+        return await search_overpass(query, city=city, limit=limit)
+    # nominatim (default)
+    return await nominatim_geocode(query, city=city, limit=limit)
+
+
+async def _send_lines(m: types.Message, lines: List[str], header: Optional[str] = None, chunk: int = 60) -> None:
+    if header:
+        await m.answer(header)
+    for i in range(0, len(lines), chunk):
+        await m.answer("\n".join(lines[i: i + chunk]))
+
+
+async def _send_gid_xlsx(m: types.Message, df: Any, filename: str = "screen_ids.xlsx", caption: str = "GID (XLSX)") -> None:
+    import pandas as pd
+    if df is None or df.empty:
+        return
+    id_col = next((c for c in ("screen_id", "GID") if c in df.columns), None)
+    if id_col is None:
+        return
+    ids = df[id_col].dropna().astype(str).drop_duplicates().reset_index(drop=True)
+    if ids.empty:
+        return
+    buf = io.BytesIO()
+    ids.to_frame().to_excel(buf, index=False)
+    buf.seek(0)
+    await m.answer_document(BufferedInputFile(buf.getvalue(), filename=filename), caption=caption)
+
+
+def _df_screen_id(df: Any) -> Optional[str]:
+    """Возвращает имя колонки с ID экрана."""
+    for c in ("screen_id", "GID"):
+        if c in df.columns:
+            return c
+    return None
 
 
 def _log_metrics() -> None:
@@ -761,6 +998,332 @@ async def main() -> None:
     @dp.message(CommandStart())
     async def start(m: types.Message) -> None:
         await m.answer("Привет! Я Omnika — помощник по DSP Omni360. Спрашивайте, разберёмся вместе 🙂")
+
+    # ===== /near =====
+    @dp.message(Command("near"))
+    async def cmd_near(m: types.Message) -> None:
+        df = store.df
+        if df is None or df.empty:
+            await m.answer("Инвентарь не загружен.")
+            return
+        parts = (m.text or "").strip().split()
+        if len(parts) < 3:
+            await m.answer("Формат: /near lat lon [radius_km]\nПример: /near 55.7143 37.5538 2")
+            return
+        try:
+            lat, lon = float(parts[1]), float(parts[2])
+            radius = float(parts[3]) if len(parts) >= 4 and "=" not in parts[3] else DEFAULT_RADIUS
+        except Exception:
+            await m.answer("Пример: /near 55.7143 37.5538 2")
+            return
+        res = find_within_radius(df, (lat, lon), radius)
+        if res is None or res.empty:
+            await m.answer(f"В радиусе {radius} км ничего не найдено.")
+            return
+        LAST_RESULT[m.chat.id] = res
+        lines = [
+            f"• {r.get('screen_id', r.get('GID', ''))} — {r.get('name', r.get('address', ''))} "
+            f"({r.get('distance_km', '')} км) [{r.get('format', '')} / {r.get('owner', '')}]"
+            for _, r in res.iterrows()
+        ]
+        await _send_lines(m, lines, header=f"Найдено: {len(res)} экр. в радиусе {radius} км", chunk=50)
+        await _send_gid_xlsx(m, res, filename="near_screen_ids.xlsx", caption="GID (XLSX)")
+
+    # ===== /near_geo =====
+    @dp.message(Command("near_geo"))
+    async def cmd_near_geo(m: types.Message) -> None:
+        import pandas as pd
+        df = store.df
+        if df is None or df.empty:
+            await m.answer("Инвентарь не загружен.")
+            return
+        text = (m.text or "").strip()
+        tail = text.split()[1:]
+        radius_km = DEFAULT_RADIUS
+        start_i = 0
+        if tail and "=" not in tail[0]:
+            try:
+                radius_km = float(tail[0].strip("[](){}"))
+                start_i = 1
+            except Exception:
+                pass
+        kv = parse_kwargs(tail[start_i:])
+        dedup = str(kv.get("dedup", "1")).lower() in {"1", "true", "yes"}
+        if "query" in kv:
+            q = kv["query"]
+            city = kv.get("city")
+            limit = int(kv.get("limit", "5") or 5)
+            provider = (kv.get("provider") or "nominatim").lower()
+            await m.answer(f"Ищу точки «{q}»" + (f" в {city}" if city else "") + "…")
+            try:
+                pois = await _geocode_any(q, city=city, limit=limit, provider=provider)
+            except Exception:
+                pois = []
+            if not pois:
+                pois = await find_poi_ai(query=q, city=city, limit=limit)
+            LAST_POI[m.chat.id] = pois
+        pois = LAST_POI.get(m.chat.id, [])
+        if not pois:
+            await m.answer("Сначала найдите точки: /geo <запрос> [city=…] — или /near_geo R query=…")
+            return
+        await m.answer(f"Подбираю экраны в радиусе {radius_km} км вокруг {len(pois)} точек…")
+        frames = []
+        for p in pois:
+            chunk_df = find_within_radius(df, (p["lat"], p["lon"]), radius_km)
+            if chunk_df is not None and not chunk_df.empty:
+                chunk_df = chunk_df.copy()
+                chunk_df["poi_name"] = p.get("name", "")
+                frames.append(chunk_df)
+        if not frames:
+            await m.answer("В выбранных радиусах экранов не нашлось.")
+            return
+        res = pd.concat(frames, ignore_index=True)
+        filter_kv = {k: v for k, v in kv.items() if k in ("format", "owner", "city")}
+        if filter_kv:
+            res = _apply_inv_filters(res, filter_kv)
+        if res.empty:
+            await m.answer("После фильтров ничего не осталось.")
+            return
+        id_col = _df_screen_id(res)
+        if dedup and id_col:
+            res = res.drop_duplicates(subset=[id_col]).reset_index(drop=True)
+        LAST_RESULT[m.chat.id] = res
+        lines = [
+            f"• {r.get('screen_id', r.get('GID', ''))} — {r.get('name', '')} "
+            f"[{r.get('format', '')}/{r.get('owner', '')}] — {r.get('distance_km', '')} км от «{r.get('poi_name', '')}»"
+            for _, r in res.head(20).iterrows()
+        ]
+        await _send_lines(m, lines, header=f"Найдено {len(res)} экранов рядом с {len(pois)} точками (радиус {radius_km} км)", chunk=50)
+        await _send_gid_xlsx(m, res, filename="near_geo_screen_ids.xlsx", caption="GID (XLSX)")
+
+    # ===== /geo =====
+    @dp.message(Command("geo"))
+    async def cmd_geo(m: types.Message) -> None:
+        parts = (m.text or "").strip().split(None, 1)
+        if len(parts) < 2:
+            await m.answer("Формат: /geo <запрос> [city=…] [provider=nominatim|openai|overpass]\nПример: /geo ТЦ Метрополис city=Москва")
+            return
+        tail = parts[1]
+        kv = parse_kwargs(tail.split())
+        # query — всё что не key=value
+        query_parts = [p for p in tail.split() if "=" not in p]
+        query = " ".join(query_parts).strip()
+        if not query:
+            await m.answer("Укажите запрос: /geo <место> [city=…]")
+            return
+        city = kv.get("city")
+        limit = int(kv.get("limit", "5") or 5)
+        provider = (kv.get("provider") or "nominatim").lower()
+        await m.answer(f"Ищу «{query}»" + (f" в {city}" if city else "") + "…")
+        pois = await _geocode_any(query, city=city, limit=limit, provider=provider)
+        if not pois:
+            pois = await find_poi_ai(query=query, city=city, limit=limit)
+        if not pois:
+            await m.answer("Не нашла подходящих мест. Попробуйте другой запрос или provider=openai")
+            return
+        LAST_POI[m.chat.id] = pois
+        lines = [f"• {p['name']} — {p['lat']:.5f}, {p['lon']:.5f} [{p.get('provider','')}]" for p in pois]
+        await _send_lines(m, lines, header=f"Найдено {len(pois)} точек (сохранено для /near_geo):", chunk=50)
+
+    # ===== /pick_city =====
+    @dp.message(Command("pick_city"))
+    async def cmd_pick_city(m: types.Message) -> None:
+        df = store.df
+        if df is None or df.empty:
+            await m.answer("Инвентарь не загружен.")
+            return
+        parts = (m.text or "").strip().split()
+        if len(parts) < 3:
+            await m.answer("Формат: /pick_city Город N [format=…] [owner=…] [shuffle=1]\nПример: /pick_city Москва 20 format=BILLBOARD")
+            return
+        pos = [p for p in parts[1:] if "=" not in p]
+        kv = parse_kwargs([p for p in parts[1:] if "=" in p])
+        try:
+            n = int(pos[-1])
+            city = " ".join(pos[:-1])
+        except Exception:
+            await m.answer("Пример: /pick_city Москва 20")
+            return
+        if not city.strip():
+            await m.answer("Нужно указать город.")
+            return
+        if "city" not in df.columns:
+            await m.answer("В инвентаре нет столбца city.")
+            return
+        subset = df[df["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
+        if kv:
+            subset = _apply_inv_filters(subset, kv)
+        if subset.empty:
+            await m.answer(f"Не нашла экранов в городе «{city}» с заданными фильтрами.")
+            return
+        shuffle_flag = str(kv.get("shuffle", "0")).lower() in {"1", "true", "yes"}
+        seed = int(kv["seed"]) if str(kv.get("seed", "")).isdigit() else None
+        if shuffle_flag:
+            subset = subset.sample(frac=1, random_state=None).reset_index(drop=True)
+        res = spread_select(subset.reset_index(drop=True), n, random_start=not str(kv.get("fixed", "0")).lower() in {"1", "true"}, seed=seed)
+        LAST_RESULT[m.chat.id] = res
+        await m.answer(f"Выбрано {len(res)} экранов в «{city}».")
+        await _send_gid_xlsx(m, res, filename=f"pick_{city}_screen_ids.xlsx", caption=f"GID по городу «{city}» (XLSX)")
+
+    # ===== /pick_at =====
+    @dp.message(Command("pick_at"))
+    async def cmd_pick_at(m: types.Message) -> None:
+        df = store.df
+        if df is None or df.empty:
+            await m.answer("Инвентарь не загружен.")
+            return
+        parts = (m.text or "").strip().split()
+        if len(parts) < 4:
+            await m.answer("Формат: /pick_at lat lon N [radius_km] [format=…]\nПример: /pick_at 55.75 37.62 30 15 format=BILLBOARD")
+            return
+        try:
+            lat, lon = float(parts[1]), float(parts[2])
+            n = int(parts[3])
+            radius = float(parts[4]) if len(parts) >= 5 and "=" not in parts[4] else 20.0
+            kv = parse_kwargs(parts[5:] if len(parts) > 5 else [])
+        except Exception:
+            await m.answer("Пример: /pick_at 55.75 37.62 30 15 format=BILLBOARD")
+            return
+        circle = find_within_radius(df, (lat, lon), radius)
+        if circle.empty:
+            await m.answer(f"В радиусе {radius} км нет экранов.")
+            return
+        fmt_arg = kv.get("format")
+        if fmt_arg and "format" in circle.columns:
+            tokens = [t.strip() for t in re.split(r"[;,|]", fmt_arg) if t.strip()]
+            if tokens:
+                col = circle["format"].astype(str)
+                mask = None
+                for tok in tokens:
+                    mk = _format_mask(col, tok)
+                    mask = mk if mask is None else (mask | mk)
+                if mask is not None:
+                    circle = circle[mask]
+        if circle.empty:
+            await m.answer(f"В радиусе {radius} км нет экранов с форматом {fmt_arg!r}.")
+            return
+        seed = int(kv["seed"]) if str(kv.get("seed", "")).isdigit() else None
+        fixed = str(kv.get("fixed", "0")).lower() in {"1", "true"}
+        res = spread_select(circle.reset_index(drop=True), n, random_start=not fixed, seed=seed)
+        LAST_RESULT[m.chat.id] = res
+        lines = [
+            f"• {r.get('screen_id', r.get('GID', ''))} — {r.get('name', '')} "
+            f"[{r.get('lat', ''):.5f},{r.get('lon', ''):.5f}] [{r.get('format', '')}/{r.get('owner', '')}]"
+            for _, r in res.iterrows()
+        ]
+        await _send_lines(m, lines, header=f"Выбрано {len(res)} экранов равномерно в радиусе {radius} км:", chunk=50)
+        await _send_gid_xlsx(m, res, filename="pick_at_screen_ids.xlsx", caption="GID (XLSX)")
+
+    # ===== /plan =====
+    @dp.message(Command("plan"))
+    async def cmd_plan(m: types.Message) -> None:
+        import pandas as pd
+        df = store.df
+        if df is None or df.empty:
+            await m.answer("Инвентарь не загружен.")
+            return
+        parts = (m.text or "").strip().split()[1:]
+        kv: Dict[str, str] = {}
+        for p in parts:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                kv[k.strip().lower()] = v.strip()
+        budget_raw = kv.get("budget") or kv.get("b")
+        if not budget_raw:
+            await m.answer(
+                "Нужно указать бюджет:\n/plan budget=200000 [city=…] [format=…] [owner=…] "
+                "[n=10] [days=10] [hours_per_day=8] [ots_min=…] [grp_min=…]"
+            )
+            return
+        try:
+            v = budget_raw.lower().replace(" ", "")
+            if v.endswith("m"):
+                budget_total = float(v[:-1]) * 1_000_000
+            elif v.endswith("k"):
+                budget_total = float(v[:-1]) * 1_000
+            else:
+                budget_total = float(v)
+        except Exception:
+            await m.answer("Не понял бюджет. Пример: budget=200000 или budget=200k")
+            return
+        city = kv.get("city")
+        n = int(kv["n"]) if kv.get("n", "").isdigit() else 10
+        days = int(kv["days"]) if kv.get("days", "").isdigit() else 10
+        hours_per_day = int(kv["hours_per_day"]) if kv.get("hours_per_day", "").isdigit() else None
+        if hours_per_day is None:
+            hours_per_day = _parse_hours_windows(kv.get("hours")) or 8
+        formats = _as_list_any(kv.get("format") or kv.get("formats"))
+        owners = _as_list_any(kv.get("owner") or kv.get("owners"))
+        want_top = str(kv.get("top", "0")).lower() in {"1", "true", "yes"}
+        pool = df.copy()
+        if city and "city" in pool.columns:
+            pool = pool[pool["city"].astype(str).str.strip().str.lower() == city.strip().lower()]
+        if pool.empty:
+            await m.answer("По заданному городу нет экранов.")
+            return
+        filter_kv: Dict[str, str] = {}
+        if formats:
+            filter_kv["format"] = ",".join(formats)
+        if owners:
+            filter_kv["owner"] = ",".join(owners)
+        for fld in ("grp_min", "ots_min"):
+            if kv.get(fld):
+                filter_kv[fld] = kv[fld]
+        if filter_kv:
+            pool = _apply_inv_filters(pool, filter_kv)
+        if pool.empty:
+            await m.answer("После применения фильтров экранов не осталось.")
+            return
+        pool = _fill_min_bid(pool)
+        if not formats:
+            pool = _prefer_formats(pool, n)
+        if want_top and "ots" in pool.columns:
+            try:
+                ots_vals = pd.to_numeric(pool["ots"], errors="coerce")
+                if not ots_vals.dropna().empty:
+                    selected = pool.assign(_ots=ots_vals).sort_values("_ots", ascending=False).head(n).drop(columns=["_ots"])
+                else:
+                    raise ValueError
+            except Exception:
+                selected = spread_select(pool.reset_index(drop=True), min(n, len(pool)))
+        else:
+            selected = spread_select(pool.reset_index(drop=True), min(n, len(pool)))
+        if selected.empty:
+            await m.answer("Не удалось выбрать экраны.")
+            return
+        n = len(selected)
+        budget_per_day_per_screen = budget_total / max(n, 1) / max(days, 1)
+        mb = pd.to_numeric(selected.get("min_bid_used"), errors="coerce")
+        median_mb = float(mb.dropna().median()) if not mb.dropna().empty else 1.0
+        mb = mb.fillna(median_mb).replace(0, median_mb)
+        per_day_cap = hours_per_day * PLAN_MAX_PLAYS_PER_HOUR
+        slots_per_day = (budget_per_day_per_screen // mb).astype(int).clip(lower=0, upper=per_day_cap)
+        total_slots = slots_per_day * days
+        planned_cost = total_slots * mb
+        out = selected.copy()
+        out["budget_per_day"] = round(budget_per_day_per_screen, 2)
+        out["min_bid_used"] = mb
+        out["planned_slots_per_day"] = slots_per_day
+        out["total_slots"] = total_slots
+        out["planned_cost"] = planned_cost
+        LAST_RESULT[m.chat.id] = selected
+        caption = (
+            f"План: бюджет={budget_total:,.0f} ₽, n={n}, days={days}, hours/day={hours_per_day}"
+        ).replace(",", " ")
+        try:
+            csv_bytes = out.to_csv(index=False).encode("utf-8-sig")
+            await m.answer_document(BufferedInputFile(csv_bytes, filename="plan.csv"), caption=caption)
+        except Exception as e:
+            await m.answer(f"Не удалось отправить CSV: {e}")
+        try:
+            xbuf = io.BytesIO()
+            with __import__("pandas").ExcelWriter(xbuf, engine="openpyxl") as w:
+                out.to_excel(w, index=False, sheet_name="plan")
+            xbuf.seek(0)
+            await m.answer_document(BufferedInputFile(xbuf.getvalue(), filename="plan.xlsx"), caption="План (XLSX)")
+        except Exception:
+            pass
+        await _send_gid_xlsx(m, selected, filename="plan_gid.xlsx", caption="GID (XLSX)")
 
     @dp.message(F.text.startswith("/learn"))
     async def learn(m: types.Message) -> None:
