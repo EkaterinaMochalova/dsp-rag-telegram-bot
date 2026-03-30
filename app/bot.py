@@ -1376,7 +1376,7 @@ async def main() -> None:
         PHOTO_STATE[m.chat.id] = {"step": "waiting_creative"}
         await m.answer(
             "Проверка фотоотчёта запущена.\n\n"
-            "Шаг 1/2: пришлите креатив — JPG, PNG или GIF.\n"
+            "Шаг 1/2: пришлите креатив — JPG, PNG, GIF или видео (MP4).\n"
             "Чтобы отменить, напишите /cancel."
         )
 
@@ -1401,15 +1401,18 @@ async def main() -> None:
             if m.photo:
                 file_id = m.photo[-1].file_id
                 ext = ".jpg"
+            elif m.video:
+                file_id = m.video.file_id
+                ext = ".mp4"
             elif m.document:
                 fn = m.document.file_name or ""
                 ext_lower = os.path.splitext(fn)[1].lower()
-                if ext_lower in (".jpg", ".jpeg", ".png", ".gif"):
+                if ext_lower in (".jpg", ".jpeg", ".png", ".gif", ".mp4", ".mov", ".avi", ".webm"):
                     file_id = m.document.file_id
                     ext = ext_lower
 
             if not file_id:
-                await m.answer("Пожалуйста, пришлите креатив — JPG, PNG или GIF.")
+                await m.answer("Пожалуйста, пришлите креатив — JPG, PNG, GIF или видео (MP4).")
                 return
 
             PHOTO_STATE[chat_id] = {"step": "waiting_report", "creative_file_id": file_id, "creative_ext": ext}

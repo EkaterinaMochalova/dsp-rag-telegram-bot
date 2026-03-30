@@ -43,13 +43,35 @@ def pil_to_bgr(img: Image.Image) -> np.ndarray:
     return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
 
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".webm", ".mkv"}
+
+
 def load_creative_frames(path: str, gif_frame_step: int = 4, max_frames: int = 24) -> List[np.ndarray]:
-    img = Image.open(path)
     ext = os.path.splitext(path)[1].lower()
+
+    if ext in VIDEO_EXTENSIONS:
+        cap = cv2.VideoCapture(path)
+        frames: List[np.ndarray] = []
+        i = 0
+        used = 0
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            if i % max(1, gif_frame_step) == 0:
+                frames.append(frame)
+                used += 1
+                if used >= max_frames:
+                    break
+            i += 1
+        cap.release()
+        return frames or []
+
+    img = Image.open(path)
     if ext != ".gif":
         return [pil_to_bgr(img)]
 
-    frames: List[np.ndarray] = []
+    frames = []
     used = 0
     for i, frame in enumerate(ImageSequence.Iterator(img)):
         if i % max(1, gif_frame_step) != 0:
