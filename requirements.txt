@@ -1,3 +1,10 @@
 openai
 aiogram
 python-dotenv
+opencv-python-headless
+numpy
+Pillow
+scikit-image
+openpyxl
+requests
+pandas

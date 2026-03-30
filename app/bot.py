@@ -2,14 +2,18 @@ import os
 import re
 import asyncio
 import logging
+import shutil
+import tempfile
 from dotenv import load_dotenv
 
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, types
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
+from aiogram.types import FSInputFile
 from typing import Optional, Dict, Any, List, Set, Tuple
 
 from inventory_qa import InventoryStore, answer_inventory_question
+from photo_checker import run_check
 
 # chat_id -> state dict
 # {
@@ -17,6 +21,14 @@ from inventory_qa import InventoryStore, answer_inventory_question
 #   "draft": "<all text merged>",
 # }
 PENDING: Dict[int, Dict[str, Any]] = {}
+
+# chat_id -> photo checker state
+# {
+#   "step": "waiting_creative" | "waiting_report" | "processing",
+#   "creative_file_id": str,
+#   "creative_ext": str,
+# }
+PHOTO_STATE: Dict[int, Dict[str, Any]] = {}
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -594,8 +606,108 @@ async def main() -> None:
     async def start(m: types.Message) -> None:
         await m.answer("Привет! Я помогу по DSP. Задайте вопрос 🙂")
 
+    @dp.message(Command("check"))
+    async def cmd_check(m: types.Message) -> None:
+        PHOTO_STATE[m.chat.id] = {"step": "waiting_creative"}
+        await m.answer(
+            "Проверка фотоотчёта запущена.\n\n"
+            "Шаг 1/2: пришлите креатив — JPG, PNG или GIF.\n"
+            "Чтобы отменить, напишите /cancel."
+        )
+
+    @dp.message(Command("cancel"))
+    async def cmd_cancel(m: types.Message) -> None:
+        if PHOTO_STATE.pop(m.chat.id, None) is not None:
+            await m.answer("Проверка отменена.")
+        else:
+            await m.answer("Нечего отменять.")
+
+    async def _handle_photo_check(m: types.Message, state: Dict[str, Any]) -> None:
+        chat_id = m.chat.id
+        step = state["step"]
+
+        if step == "processing":
+            await m.answer("Уже обрабатываю, подождите...")
+            return
+
+        if step == "waiting_creative":
+            file_id: Optional[str] = None
+            ext = ""
+            if m.photo:
+                file_id = m.photo[-1].file_id
+                ext = ".jpg"
+            elif m.document:
+                fn = m.document.file_name or ""
+                ext_lower = os.path.splitext(fn)[1].lower()
+                if ext_lower in (".jpg", ".jpeg", ".png", ".gif"):
+                    file_id = m.document.file_id
+                    ext = ext_lower
+
+            if not file_id:
+                await m.answer("Пожалуйста, пришлите креатив — JPG, PNG или GIF.")
+                return
+
+            PHOTO_STATE[chat_id] = {"step": "waiting_report", "creative_file_id": file_id, "creative_ext": ext}
+            await m.answer("Принято! Шаг 2/2: пришлите эфирную справку (.xlsx).")
+            return
+
+        if step == "waiting_report":
+            if not m.document:
+                await m.answer("Пожалуйста, пришлите файл эфирной справки в формате .xlsx.")
+                return
+            fn = m.document.file_name or ""
+            if not fn.lower().endswith(".xlsx"):
+                await m.answer("Нужен файл формата .xlsx (эфирная справка).")
+                return
+
+            report_file_id = m.document.file_id
+            creative_file_id = state["creative_file_id"]
+            creative_ext = state["creative_ext"]
+
+            PHOTO_STATE[chat_id] = {**state, "step": "processing"}
+            await m.answer("Обрабатываю... Это может занять несколько минут.")
+
+            tmp_dir = tempfile.mkdtemp(prefix="photo_check_")
+            try:
+                creative_path = os.path.join(tmp_dir, f"creative{creative_ext}")
+                report_path = os.path.join(tmp_dir, "report.xlsx")
+                out_dir = os.path.join(tmp_dir, "out")
+                os.makedirs(out_dir)
+
+                await bot.download(creative_file_id, destination=creative_path)
+                await bot.download(report_file_id, destination=report_path)
+
+                result_path, debug_zip, summary = await asyncio.to_thread(
+                    run_check, creative_path, report_path, out_dir
+                )
+
+                await m.answer_document(FSInputFile(result_path), caption="Результат проверки")
+
+                if debug_zip and os.path.exists(debug_zip):
+                    zip_size = os.path.getsize(debug_zip)
+                    if zip_size <= 50 * 1024 * 1024:
+                        await m.answer_document(FSInputFile(debug_zip), caption="Спорные примеры (debug)")
+                    else:
+                        await m.answer("Архив со спорными примерами слишком большой для отправки (>50 МБ).")
+
+                await m.answer(summary)
+            except Exception as e:
+                logging.exception("Photo check failed")
+                await m.answer(f"Ошибка при проверке:\n{e}")
+            finally:
+                PHOTO_STATE.pop(chat_id, None)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+
     @dp.message()
     async def handle(m: types.Message) -> None:
+        chat_id = m.chat.id
+
+        # Photo checker state machine — handles photo/document messages too
+        photo_state = PHOTO_STATE.get(chat_id)
+        if photo_state:
+            await _handle_photo_check(m, photo_state)
+            return
+
         text = (m.text or "").strip()
         if not text:
             return
