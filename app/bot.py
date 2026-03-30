@@ -20,7 +20,7 @@ from aiogram.types import BufferedInputFile, FSInputFile
 from typing import Optional, Dict, Any, List, Set, Tuple
 
 from inventory_qa import InventoryStore, answer_inventory_question
-from photo_checker import run_check
+from photo_checker import run_check, run_check_from_zip
 from geo_ai import find_poi_ai
 from geo_nominatim import geocode_query as nominatim_geocode
 from overpass_provider import search_overpass
@@ -1416,21 +1416,23 @@ async def main() -> None:
                 return
 
             PHOTO_STATE[chat_id] = {"step": "waiting_report", "creative_file_id": file_id, "creative_ext": ext}
-            await m.answer("Принято! Шаг 2/2: пришлите эфирную справку (.xlsx).")
+            await m.answer("Принято! Шаг 2/2: пришлите эфирную справку (.xlsx) или архив с фото (.zip).")
             return
 
         if step == "waiting_report":
             if not m.document:
-                await m.answer("Пожалуйста, пришлите файл эфирной справки в формате .xlsx.")
+                await m.answer("Пожалуйста, пришлите эфирную справку (.xlsx) или архив с фото (.zip).")
                 return
             fn = m.document.file_name or ""
-            if not fn.lower().endswith(".xlsx"):
-                await m.answer("Нужен файл формата .xlsx (эфирная справка).")
+            fn_lower = fn.lower()
+            if not (fn_lower.endswith(".xlsx") or fn_lower.endswith(".zip")):
+                await m.answer("Нужен файл .xlsx (эфирная справка) или .zip (архив с фото).")
                 return
 
             report_file_id = m.document.file_id
             creative_file_id = state["creative_file_id"]
             creative_ext = state["creative_ext"]
+            use_zip = fn_lower.endswith(".zip")
 
             PHOTO_STATE[chat_id] = {**state, "step": "processing"}
             await m.answer("Обрабатываю... Это может занять несколько минут.")
@@ -1438,16 +1440,22 @@ async def main() -> None:
             tmp_dir = tempfile.mkdtemp(prefix="photo_check_")
             try:
                 creative_path = os.path.join(tmp_dir, f"creative{creative_ext}")
-                report_path = os.path.join(tmp_dir, "report.xlsx")
+                report_ext = ".zip" if use_zip else ".xlsx"
+                report_path = os.path.join(tmp_dir, f"report{report_ext}")
                 out_dir = os.path.join(tmp_dir, "out")
                 os.makedirs(out_dir)
 
                 await bot.download(creative_file_id, destination=creative_path)
                 await bot.download(report_file_id, destination=report_path)
 
-                result_path, debug_zip, summary = await asyncio.to_thread(
-                    run_check, creative_path, report_path, out_dir
-                )
+                if use_zip:
+                    result_path, debug_zip, summary = await asyncio.to_thread(
+                        run_check_from_zip, creative_path, report_path, out_dir
+                    )
+                else:
+                    result_path, debug_zip, summary = await asyncio.to_thread(
+                        run_check, creative_path, report_path, out_dir
+                    )
 
                 await m.answer_document(FSInputFile(result_path), caption="Результат проверки")
 

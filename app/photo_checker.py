@@ -554,3 +554,100 @@ def run_check(creative_path: str, report_path: str, out_dir: str) -> Tuple[str, 
     )
 
     return result_path, debug_zip, summary
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
+
+
+def run_check_from_zip(creative_path: str, zip_path: str, out_dir: str) -> Tuple[str, Optional[str], str]:
+    """Like run_check but reads photos from a ZIP archive instead of downloading from URLs."""
+    creative_frames = load_creative_frames(creative_path)
+    total_frames = len(creative_frames)
+
+    extract_dir = os.path.join(out_dir, "extracted")
+    os.makedirs(extract_dir, exist_ok=True)
+
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+
+    photo_paths: List[Tuple[int, str]] = []
+    for root, _, files in os.walk(extract_dir):
+        for fname in sorted(files):
+            if os.path.splitext(fname)[1].lower() in IMAGE_EXTENSIONS:
+                photo_paths.append((len(photo_paths) + 1, os.path.join(root, fname)))
+
+    total = len(photo_paths)
+    out_rows: List[Dict[str, Any]] = []
+    debug_dir = os.path.join(out_dir, "debug")
+
+    for row_number, photo_path in photo_paths:
+        filename = os.path.relpath(photo_path, extract_dir)
+        try:
+            photo_img = Image.open(photo_path).convert("RGB")
+            photo_bgr = pil_to_bgr(photo_img)
+            best = best_match_across_frames(creative_frames, photo_bgr)
+
+            if best["status"] in ("REVIEW", "NO"):
+                save_debug(debug_dir, row_number, filename, best)
+
+            res = MatchResult(
+                row_number=row_number,
+                photo_id=filename,
+                photo_url="",
+                status=best["status"],
+                confidence=round(best["confidence"], 4),
+                best_frame_index=int(best["frame_index"]),
+                total_frames_checked=total_frames,
+                best_method=str(best.get("best_method", best.get("method", ""))),
+                good_matches=int(best["good_matches"]),
+                inliers=int(best["inliers"]),
+                inlier_ratio=round(best["inlier_ratio"], 4),
+                matched_area_ratio=round(best["matched_area_ratio"], 6),
+                ssim_score=round(best["ssim_score"], 4),
+                hist_score=round(best["hist_score"], 4),
+                raw_score=round(best["raw_score"], 4),
+            )
+        except Exception as e:
+            res = MatchResult(
+                row_number=row_number,
+                photo_id=filename,
+                photo_url="",
+                status="REVIEW",
+                confidence=0.0,
+                best_frame_index=-1,
+                total_frames_checked=total_frames,
+                best_method="",
+                good_matches=0,
+                inliers=0,
+                inlier_ratio=0.0,
+                matched_area_ratio=0.0,
+                ssim_score=0.0,
+                hist_score=0.0,
+                raw_score=0.0,
+                error=f"{type(e).__name__}: {e}",
+            )
+
+        out_rows.append(asdict(res))
+
+    result_path = os.path.join(out_dir, "result.xlsx")
+    save_results(out_rows, result_path)
+
+    debug_zip: Optional[str] = None
+    if os.path.exists(debug_dir):
+        debug_zip = os.path.join(out_dir, "debug.zip")
+        zip_folder(debug_dir, debug_zip)
+
+    df = pd.DataFrame(out_rows)
+    yes_count = int((df["status"] == "YES").sum()) if "status" in df.columns else 0
+    review_count = int((df["status"] == "REVIEW").sum()) if "status" in df.columns else 0
+    no_count = int((df["status"] == "NO").sum()) if "status" in df.columns else 0
+
+    summary = (
+        f"Проверка завершена.\n\n"
+        f"Всего фото: {total}\n"
+        f"YES (совпадает): {yes_count}\n"
+        f"REVIEW (нужна ручная проверка): {review_count}\n"
+        f"NO (не совпадает): {no_count}"
+    )
+
+    return result_path, debug_zip, summary
