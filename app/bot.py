@@ -1428,6 +1428,15 @@ async def main() -> None:
             if not (fn_lower.endswith(".xlsx") or fn_lower.endswith(".zip")):
                 await m.answer("Нужен файл .xlsx (эфирная справка) или .zip (архив с фото).")
                 return
+            file_size_mb = (m.document.file_size or 0) / 1024 / 1024
+            if file_size_mb > 20:
+                await m.answer(
+                    f"Файл слишком большой ({file_size_mb:.0f} МБ) — Telegram позволяет боту скачивать максимум 20 МБ.\n\n"
+                    "Пожалуйста, разбейте архив на части по 15–20 МБ и пришлите по очереди.\n"
+                    "Для каждой части запускайте /check заново."
+                )
+                PHOTO_STATE.pop(chat_id, None)
+                return
 
             report_file_id = m.document.file_id
             creative_file_id = state["creative_file_id"]
