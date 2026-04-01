@@ -1371,9 +1371,14 @@ async def main() -> None:
             logging.exception("Failed to save fact to vector store (non-critical)")
         await m.answer(f"✅ Запомнила: {fact}")
 
+    def _photo_state_key(m: types.Message) -> tuple:
+        # keyed per user, not per chat — prevents group chat spam
+        user_id = m.from_user.id if m.from_user else 0
+        return (m.chat.id, user_id)
+
     @dp.message(Command("check"))
     async def cmd_check(m: types.Message) -> None:
-        PHOTO_STATE[m.chat.id] = {"step": "waiting_creative"}
+        PHOTO_STATE[_photo_state_key(m)] = {"step": "waiting_creative"}
         await m.answer(
             "Проверка фотоотчёта запущена.\n\n"
             "Шаг 1/2: пришлите креатив — JPG, PNG, GIF или видео (MP4).\n"
@@ -1382,17 +1387,19 @@ async def main() -> None:
 
     @dp.message(Command("cancel"))
     async def cmd_cancel(m: types.Message) -> None:
-        if PHOTO_STATE.pop(m.chat.id, None) is not None:
+        if PHOTO_STATE.pop(_photo_state_key(m), None) is not None:
             await m.answer("Проверка отменена.")
         else:
             await m.answer("Нечего отменять.")
 
     async def _handle_photo_check(m: types.Message, state: Dict[str, Any]) -> None:
-        chat_id = m.chat.id
+        key = _photo_state_key(m)
         step = state["step"]
 
         if step == "processing":
-            await m.answer("Уже обрабатываю, подождите...")
+            # молчим в группах, отвечаем только в личке
+            if m.chat.type == "private":
+                await m.answer("Уже обрабатываю, подождите...")
             return
 
         if step == "waiting_creative":
@@ -1415,7 +1422,7 @@ async def main() -> None:
                 await m.answer("Пожалуйста, пришлите креатив — JPG, PNG, GIF или видео (MP4).")
                 return
 
-            PHOTO_STATE[chat_id] = {"step": "waiting_report", "creative_file_id": file_id, "creative_ext": ext}
+            PHOTO_STATE[key] = {"step": "waiting_report", "creative_file_id": file_id, "creative_ext": ext}
             await m.answer("Принято! Шаг 2/2: пришлите эфирную справку (.xlsx) или архив с фото (.zip).")
             return
 
@@ -1435,7 +1442,7 @@ async def main() -> None:
                     "Пожалуйста, разбейте архив на части по 15–20 МБ и пришлите по очереди.\n"
                     "Для каждой части запускайте /check заново."
                 )
-                PHOTO_STATE.pop(chat_id, None)
+                PHOTO_STATE.pop(key, None)
                 return
 
             report_file_id = m.document.file_id
@@ -1443,7 +1450,7 @@ async def main() -> None:
             creative_ext = state["creative_ext"]
             use_zip = fn_lower.endswith(".zip")
 
-            PHOTO_STATE[chat_id] = {**state, "step": "processing"}
+            PHOTO_STATE[key] = {**state, "step": "processing"}
             await m.answer("Обрабатываю... Это может занять несколько минут.")
 
             tmp_dir = tempfile.mkdtemp(prefix="photo_check_")
@@ -1479,18 +1486,18 @@ async def main() -> None:
                 logging.exception("Photo check failed")
                 await m.answer(f"Ошибка при проверке:\n{e}")
             finally:
-                PHOTO_STATE.pop(chat_id, None)
+                PHOTO_STATE.pop(key, None)
                 shutil.rmtree(tmp_dir, ignore_errors=True)
 
     @dp.message()
     async def handle(m: types.Message) -> None:
-        chat_id = m.chat.id
-
-        # Photo checker state machine — handles photo/document messages too
-        photo_state = PHOTO_STATE.get(chat_id)
+        # Photo checker state machine — keyed per user, handles photo/document messages too
+        photo_state = PHOTO_STATE.get(_photo_state_key(m))
         if photo_state:
             await _handle_photo_check(m, photo_state)
             return
+
+        chat_id = m.chat.id
 
         text = (m.text or "").strip()
         if not text:
