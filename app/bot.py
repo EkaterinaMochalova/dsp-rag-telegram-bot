@@ -1408,6 +1408,10 @@ async def main() -> None:
             if m.photo:
                 file_id = m.photo[-1].file_id
                 ext = ".jpg"
+            elif m.animation:
+                # Telegram GIFs are stored as mp4 internally
+                file_id = m.animation.file_id
+                ext = ".mp4"
             elif m.video:
                 file_id = m.video.file_id
                 ext = ".mp4"
