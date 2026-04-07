@@ -328,12 +328,12 @@ def classify_candidate(c: Dict[str, Any]) -> Tuple[str, float]:
     raw_score = c["raw_score"]
 
     yes_rule_1 = (
-        inliers >= 8 and inlier_ratio >= 0.18 and area_ratio >= 0.0015 and (ssim_score >= 0.28 or hist_score >= 0.62)
+        inliers >= 6 and inlier_ratio >= 0.13 and area_ratio >= 0.001 and (ssim_score >= 0.20 or hist_score >= 0.52)
     )
-    yes_rule_2 = good >= 12 and inliers >= 10 and area_ratio >= 0.0025
-    yes_rule_3 = raw_score >= 0.48 and inliers >= 8
+    yes_rule_2 = good >= 10 and inliers >= 8 and area_ratio >= 0.0015
+    yes_rule_3 = raw_score >= 0.40 and inliers >= 6
 
-    review_rule = (inliers >= 6 and area_ratio >= 0.001) or raw_score >= 0.34
+    review_rule = (inliers >= 4 and area_ratio >= 0.0008) or raw_score >= 0.28
 
     confidence = min(0.99, max(0.0, 0.25 + raw_score))
 
