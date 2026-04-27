@@ -13,6 +13,7 @@ from collections import defaultdict
 from dotenv import load_dotenv
 
 import aiohttp
+from aiohttp import web
 from openai import OpenAI
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
@@ -70,6 +71,9 @@ FINANCE_TAG = os.getenv("FINANCE_TAG", "")
 CS_TAGS = os.getenv("CS_TAGS", "")
 FEEDBACK_CHANNEL_ID = os.getenv("FEEDBACK_CHANNEL_ID", "")
 CALCULATOR_URL = os.getenv("CALCULATOR_URL", "https://omni360.adtech.systems/page103658706.html")
+MANAGER_CHAT_ID = int(os.getenv("MANAGER_CHAT_ID", "-1003957957237"))
+PLAN_WEBHOOK_SECRET = os.getenv("PLAN_WEBHOOK_SECRET", "")
+PORT = int(os.getenv("PORT", "8080"))
 
 EMPLOYEE_USERNAMES = set(filter(None, os.getenv("EMPLOYEE_USERNAMES", "").split(",")))
 CREATIVE_HELP_REPLY = """Проверьте, пожалуйста, несколько моментов:
@@ -1703,6 +1707,73 @@ async def main() -> None:
 
         await track("rag", resolved=True, m=m)
         await m.answer(reply)
+
+    # ===== HTTP /send_plan endpoint =====
+    async def _cors_headers(response: web.Response) -> web.Response:
+        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Access-Control-Allow-Methods"] = "POST, OPTIONS"
+        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-Secret"
+        return response
+
+    async def handle_send_plan(request: web.Request) -> web.Response:
+        if PLAN_WEBHOOK_SECRET:
+            if request.headers.get("X-Secret", "") != PLAN_WEBHOOK_SECRET:
+                return await _cors_headers(web.json_response({"ok": False, "error": "unauthorized"}, status=401))
+        try:
+            data = await request.json()
+        except Exception:
+            return await _cors_headers(web.json_response({"ok": False, "error": "invalid json"}, status=400))
+
+        if not MANAGER_CHAT_ID:
+            return await _cors_headers(web.json_response({"ok": False, "error": "MANAGER_CHAT_ID not set"}, status=500))
+
+        user_email = data.get("user_email") or "—"
+        regions    = ", ".join(data.get("regions") or []) or "—"
+        date_start = data.get("date_start") or "—"
+        date_end   = data.get("date_end") or "—"
+        budget     = data.get("budget")
+        screens    = data.get("screens")
+        plays      = data.get("plays")
+        ots        = data.get("ots")
+        formats    = ", ".join(data.get("formats") or []) or "—"
+        sel_mode   = data.get("selection_mode") or "—"
+
+        def fmt_num(n):
+            try: return f"{int(n):,}".replace(",", " ")
+            except: return "—"
+
+        msg = (
+            "📋 <b>Новый медиаплан</b>\n\n"
+            f"👤 <b>Клиент:</b> {user_email}\n"
+            f"📍 <b>Регион(ы):</b> {regions}\n"
+            f"📅 <b>Даты:</b> {date_start} → {date_end}\n"
+            f"💰 <b>Бюджет:</b> {fmt_num(budget)} ₽\n"
+            f"🖥 <b>Экранов:</b> {fmt_num(screens)}\n"
+            f"▶️ <b>Выходов:</b> {fmt_num(plays)}\n"
+            + (f"👁 <b>OTS:</b> {fmt_num(ots)}\n" if ots else "")
+            + f"🗂 <b>Форматы:</b> {formats}\n"
+            f"📌 <b>Подбор:</b> {sel_mode}"
+        )
+
+        try:
+            await bot.send_message(MANAGER_CHAT_ID, msg, parse_mode="HTML")
+        except Exception as e:
+            logging.exception("Failed to send plan to Telegram")
+            return await _cors_headers(web.json_response({"ok": False, "error": str(e)}, status=500))
+
+        return await _cors_headers(web.json_response({"ok": True}))
+
+    async def handle_options(request: web.Request) -> web.Response:
+        return await _cors_headers(web.Response(status=204))
+
+    http_app = web.Application()
+    http_app.router.add_post("/send_plan", handle_send_plan)
+    http_app.router.add_options("/send_plan", handle_options)
+
+    runner = web.AppRunner(http_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    logging.info("HTTP server listening on port %d", PORT)
 
     async def _hourly_metrics() -> None:
         """Каждый час пишет метрики в лог и чистит протухшие PENDING."""
