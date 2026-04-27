@@ -1719,10 +1719,29 @@ async def main() -> None:
         if PLAN_WEBHOOK_SECRET:
             if request.headers.get("X-Secret", "") != PLAN_WEBHOOK_SECRET:
                 return await _cors_headers(web.json_response({"ok": False, "error": "unauthorized"}, status=401))
-        try:
-            data = await request.json()
-        except Exception:
-            return await _cors_headers(web.json_response({"ok": False, "error": "invalid json"}, status=400))
+
+        data: dict = {}
+        file_bytes: bytes | None = None
+        file_name = "mediaplan.xlsx"
+
+        content_type = request.content_type or ""
+        if "multipart" in content_type:
+            try:
+                reader = await request.multipart()
+                async for part in reader:
+                    if part.name == "data":
+                        raw = await part.read()
+                        data = json.loads(raw)
+                    elif part.name == "file":
+                        file_name = part.filename or file_name
+                        file_bytes = await part.read()
+            except Exception:
+                return await _cors_headers(web.json_response({"ok": False, "error": "invalid multipart"}, status=400))
+        else:
+            try:
+                data = await request.json()
+            except Exception:
+                return await _cors_headers(web.json_response({"ok": False, "error": "invalid json"}, status=400))
 
         if not MANAGER_CHAT_ID:
             return await _cors_headers(web.json_response({"ok": False, "error": "MANAGER_CHAT_ID not set"}, status=500))
@@ -1757,6 +1776,8 @@ async def main() -> None:
 
         try:
             await bot.send_message(MANAGER_CHAT_ID, msg, parse_mode="HTML")
+            if file_bytes:
+                await bot.send_document(MANAGER_CHAT_ID, BufferedInputFile(file_bytes, filename=file_name))
         except Exception as e:
             logging.exception("Failed to send plan to Telegram")
             return await _cors_headers(web.json_response({"ok": False, "error": str(e)}, status=500))
